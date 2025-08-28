@@ -3,3 +3,6 @@
 .ipynb_checkpoints
 compile_commands.json
 .vscode
+*.tif
+runs/
+checkpoints/

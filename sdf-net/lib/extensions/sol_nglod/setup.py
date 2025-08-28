@@ -37,7 +37,7 @@ setup(
         CUDAExtension(
             name='sol_nglod',
             sources=['sol_nglod_kernel.cu'],
-            extra_compile_args={'cxx': ['-std=c++14', '-ffast-math'], 'nvcc': ['-std=c++14']})],
+            extra_compile_args={'cxx': ['-std=c++17', '-ffast-math'], 'nvcc': ['-std=c++17']})],
     cmdclass={ 'build_ext' : BuildExtension }
 )
 

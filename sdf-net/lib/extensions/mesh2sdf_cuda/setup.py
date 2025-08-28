@@ -21,7 +21,7 @@ setup(
         CUDAExtension(
             name='mesh2sdf',
             sources=['mesh2sdf_kernel.cu'],
-            extra_compile_args={'cxx': ['-std=c++14', '-ffast-math'], 'nvcc': ['-std=c++14']})
+            extra_compile_args={'cxx': ['-std=c++17', '-ffast-math'], 'nvcc': ['-std=c++17']})
     ],
     cmdclass={
         'build_ext': BuildExtension

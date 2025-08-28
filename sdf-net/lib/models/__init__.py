@@ -22,5 +22,5 @@
 from .OverfitSDF import OverfitSDF
 from .BasicDecoder import BasicDecoder
 from .OctreeSDF import OctreeSDF
-from .SOL_NGLOD import SOL_NGLOD
+# from .SOL_NGLOD import SOL_NGLOD  # 注释掉，因为需要编译 sol_nglod 扩展
 
