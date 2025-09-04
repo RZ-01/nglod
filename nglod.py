@@ -66,15 +66,15 @@ class Args:
         
         # 基础参数
         self.input_dim = 3           
-        self.interpolate = 'linear'      # LOD插值值
-        
+        self.interpolate = None     # LOD插值值（None表示不插值，或者设为0.0-1.0之间的浮点数）
+
         self.epochs = 10000          
         self.batch_size = 100000        # 保持大批量训练
         self.grow_every = 1000       # 增加LOD增长间隔：1000→1500，让每个LOD训练更充分
         self.growth_strategy = 'increase'  
         
         self.optimizer = 'adam'      
-        self.lr = 1e-2           
+        self.lr = 1e-4           
         self.loss = ['l1_loss']    # 使用L1损失
         self.return_lst = True      
 
@@ -92,7 +92,7 @@ def main():
     print("Normalized volume")
     dz, dy, dx = vol.shape
     n_samples = 600000  
-    epochs_per_batch = 2000  
+    epochs_per_batch = 1000  
     threshold = 0.02
 
     T = np.array([dx-1, dy-1, dz-1], dtype=np.float32)  
@@ -112,7 +112,7 @@ def main():
     
     # TRAIN - 使用args中的参数
     opt = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     
     # 创建checkpoints目录
     os.makedirs('checkpoints', exist_ok=True)
@@ -163,7 +163,7 @@ def main():
                 print(f"\nEpoch {current_epoch + epoch}: Growing to stage {current_stage} (training LODs: {get_loss_lods(current_stage)})")
                 opt = optim.Adam(model.parameters(), lr=args.lr)
                 remaining_steps = total_epochs - (current_epoch + epoch)
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=remaining_steps, eta_min=1e-4)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=remaining_steps, eta_min=1e-6)
             
             # 获取当前要训练的LOD级别
             loss_lods = get_loss_lods(current_stage, args.growth_strategy)

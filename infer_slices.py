@@ -33,17 +33,17 @@ class Args:
         
         # 基础参数
         self.input_dim = 3           
-        self.interpolate = 'linear'      # LOD插值值
+        self.interpolate = None      # LOD插值值（None表示不插值，或者设为0.0-1.0之间的浮点数）
         
-        self.epochs = 12000          
+        self.epochs = 10000          
         self.batch_size = 100000        # 保持大批量训练
-        self.grow_every = 3000       # 增加LOD增长间隔：1000→1500，让每个LOD训练更充分
-        self.growth_strategy = 'onebyone'  
+        self.grow_every = 1000       # 增加LOD增长间隔：1000→1500，让每个LOD训练更充分
+        self.growth_strategy = 'increase'  
         
         self.optimizer = 'adam'      
-        self.lr = 3e-4           
+        self.lr = 1e-4           
         self.loss = ['l1_loss']    # 使用L1损失
-        self.return_lst = True          
+        self.return_lst = True            
 
 
 def read_volume_shape(tif_path: str):
@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--num_slices", type=int, default=5, help="How many random z-slices to infer")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for selecting slices")
-    parser.add_argument("--lod_level", type=int, default=None, help="Specific LOD level to use (0=coarse, 4=fine). None=auto select highest")
+    parser.add_argument("--lod_level", type=int, default=0, help="Specific LOD level to use (0=coarse, 4=fine). None=auto select highest")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
