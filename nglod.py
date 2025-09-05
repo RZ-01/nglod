@@ -53,12 +53,12 @@ class Args:
         self.net = 'OctreeSDF'
         self.feature_dim = 32     
         self.feature_size = 4        
-        self.num_layers = 3         
+        self.num_layers = 1         
         self.hidden_dim = 512      
         self.input_dim = 3           
         
         # ===== LOD相关参数 =====
-        self.num_lods = 8           
+        self.num_lods = 5           
         self.base_lod = 2            
         self.interpolate = None    
         self.growth_strategy = 'increase'  
@@ -73,7 +73,7 @@ class Args:
         self.batch_size = 100000       
         self.optimizer = 'adam'      
         self.lr = 6e-4         
-        self.loss = ['l1_loss']    # 使用L1损失
+        self.loss = ['l1_loss']    
         
         # ===== 其他参数 =====
         self.pos_invariant = False   
@@ -82,20 +82,18 @@ class Args:
         self.return_lst = True      
 
 def main():
-    # 配置并实例化 NGLOD 模型
     args = Args()
     
     vol = tifffile.imread('../data/Mouse_Heart_Angle0_patch.tif')
     print("Loaded volume")
 
-    # Keep original max for de-normalization in PSF fine-tuning
     vol = vol.astype(np.float32)
     vol_max = float(vol.max())
     vol = vol / vol_max
     print("Normalized volume")
     dz, dy, dx = vol.shape
-    n_samples = 1000000  
-    epochs_per_batch = 10000  
+    n_samples = 600000  
+    epochs_per_batch = 1000  
     threshold = 0.03
 
     T = np.array([dx-1, dy-1, dz-1], dtype=np.float32)  
@@ -123,25 +121,20 @@ def main():
 
     model.train()
     
-    # 初始化LOD训练策略 - 这是NGLOD的关键！
-    current_stage = 1  # 从stage 1开始（对应LOD 0）
+    current_stage = 1 
     max_stage = args.num_lods
     
-    # TRAIN - 使用args中的参数
     opt = optim.Adam(model.parameters(), lr=args.lr)
     
-    # 创建checkpoints目录
     os.makedirs('checkpoints', exist_ok=True)
 
-    total_epochs = args.epochs  # 使用args中的epochs
+    total_epochs = args.epochs 
     current_epoch = 0
     batch_idx = 0
     
-    # LOD增长策略：使用args中的grow_every参数
     lod_grow_interval = args.grow_every
-    last_grow_epoch = 0  # 记录上次增长LOD的epoch
+    last_grow_epoch = 0 
     
-    # 初始化loss_lods（官方实现的核心概念）
     def get_loss_lods(stage, strategy='increase'):
         if strategy == 'increase':
             return list(range(0, stage))
@@ -169,14 +162,12 @@ def main():
         dataset = VolumeDataset(coords, values, n_per_batch=args.batch_size, thresh=threshold)
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
-        # 创建进度条
         pbar = tqdm(total=epochs_per_batch, desc=f"Training batch {batch_idx + 1}", ncols=100, 
                     dynamic_ncols=True, leave=True, file=None, 
                     ascii=True, disable=False)
         start_time = time.time()
 
         for epoch in range(epochs_per_batch):
-            # 检查是否需要增长LOD级别 - 确保只在达到指定间隔时增长一次
             if (current_epoch + epoch >= last_grow_epoch + lod_grow_interval and 
                 current_stage < max_stage and 
                 current_epoch + epoch > 0):
@@ -184,7 +175,6 @@ def main():
                 last_grow_epoch = current_epoch + epoch
                 print(f"\nEpoch {current_epoch + epoch}: Growing to stage {current_stage} (training LODs: {get_loss_lods(current_stage)})")
             
-            # 获取当前要训练的LOD级别
             loss_lods = get_loss_lods(current_stage, args.growth_strategy)
             
             total_loss = 0
@@ -192,25 +182,21 @@ def main():
                 batch_coords = batch_coords.to(device)
                 target = batch_val.to(device).unsqueeze(-1)
                 
-                # NGLOD官方方式：获取所有LOD级别的预测
                 preds = []
                 if args.return_lst:
-                    # 方式1：一次性返回所有预测
                     all_preds = model.sdf(batch_coords, return_lst=True)
                     preds = [all_preds[i] for i in loss_lods]
                 else:
-                    # 方式2：分别计算每个LOD级别
                     for lod in loss_lods:
                         preds.append(model.sdf(batch_coords, lod=lod))
                 
-                # 计算损失（使用L1损失）
                 loss = 0
                 _l1_loss = 0
                 for pred in preds:
-                    _l1_loss = torch.abs(pred - target).mean()  # L1损失
+                    _l1_loss = torch.abs(pred - target).mean()  
                     loss += _l1_loss
                 
-                loss = loss / batch_coords.size(0)  # 除以batch_size
+                loss = loss / batch_coords.size(0)  
 
                 opt.zero_grad()
                 loss.backward()
@@ -218,19 +204,16 @@ def main():
 
                 opt.step()
                 total_loss += loss.item() * batch_coords.size(0)   
-                
+            
+                            
             elapsed_time = time.time() - start_time
             pbar.set_postfix({
                 'Loss': f'{total_loss:.6f}',
-                'Stage': f'{current_stage}',
-                'LODs': f'{loss_lods}',
                 'Grad': f'{total_norm:.2e}',
                 'Time': f'{elapsed_time:.1f}s'
             })
             pbar.update(1)
-            
-            if (epoch + 1) % 10 == 0: 
-                print(f"Epoch {current_epoch + epoch + 1}: l1 loss = {total_loss:.6f}, Stage = {current_stage}, LODs = {loss_lods}, Gradient norm: {total_norm:.8e}")
+
             writer.add_scalar("Loss/l1", total_loss, current_epoch + epoch)
             writer.add_scalar("Training/current_stage", current_stage, current_epoch + epoch)
             writer.add_scalar("Gradient/norm", total_norm, current_epoch + epoch)
@@ -246,7 +229,7 @@ def main():
         'optimizer_state_dict': opt.state_dict(),
         'loss': total_loss,
         'args': args,
-        'current_stage': current_stage,  # 保存当前训练阶段
+        'current_stage': current_stage,  
         'transformation': {
             'T': T,
         }
