@@ -62,20 +62,6 @@ def create_G_psf(size=15, sigma=2.0):
     psf = psf / psf.sum()
     return psf
 
-
-class PosEncoding(nn.Module):
-    def __init__(self, L: int = 6):
-        super().__init__()
-        self.L = L
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = [x]
-        for i in range(self.L):
-            for fn in (torch.sin, torch.cos):
-                feats.append(fn((2.0 ** i) * np.pi * x))
-        return torch.cat(feats, dim=-1)
-
-
 class NGLODArgs:
     """NGLOD 图像去模糊的参数配置"""
     def __init__(self):
@@ -88,7 +74,7 @@ class NGLODArgs:
         self.num_layers = 2          # MLP层数
         
         # ===== LOD相关参数 =====
-        self.num_lods = 4            # LOD级别数量
+        self.num_lods = 6            # LOD级别数量
         self.base_lod = 2            # 基础LOD级别
         self.interpolate = None      # LOD插值（None或0.0-1.0）
         
@@ -98,8 +84,10 @@ class NGLODArgs:
         self.ff_width = 16.0         # Fourier特征宽度 (控制频率范围)
         
         # ===== 训练参数 =====
+        self.epochs = 2000
         self.grow_every = -1        # 每隔多少epoch增长LOD
         self.growth_strategy = 'increase'  # LOD增长策略
+        self.lr = 1e-3
         
         # ===== 其他参数 =====
         self.pos_invariant = False   # 位置不变性
@@ -107,21 +95,6 @@ class NGLODArgs:
         self.feat_sum = False        # 特征求和
         self.return_lst = True       # 返回所有LOD预测
         self.optimizer = 'adam'      # 优化器
-
-
-class SimpleMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 512, n_layers: int = 6):
-        super().__init__()
-        layers = []
-        for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.ReLU(inplace=True))
-        layers.append(nn.Linear(hidden_dim, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.net(x))
-
 
 def sample_random_patch(H: int, W: int, patch_h: int, patch_w: int):
     y0 = np.random.randint(0, max(1, H - patch_h + 1))
@@ -166,25 +139,16 @@ def apply_psf_torch(image, psf, device=None):
     
     return blurred
 
-def train_deblur_nglod(clear_img, blurred_img, psf, total_epochs=4000, lr=0.0001):
+def train_deblur_nglod(clear_img, blurred_img, psf, lr=0.0001):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     H, W = clear_img.shape
     blurred_tensor = torch.from_numpy(blurred_img).float().unsqueeze(0).unsqueeze(0).to(device)
 
     args = NGLODArgs()
-    try:
-        model = OctreeSDF(args).to(device)
-    except NameError:
-        print("Warning: OctreeSDF not available, falling back to SimpleMLP")
-        pe = PosEncoding(L=6).to(device)
-        in_dim = 3 * (2 * 6 + 1)  # 3D坐标的位置编码
-        model = SimpleMLP(in_dim=in_dim).to(device)
-        use_nglod = False
-    else:
-        use_nglod = True
-        pe = None
-    
+
+    model = OctreeSDF(args).to(device)
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, fused=True)
 
     psf_kernel = torch.from_numpy(psf).float().unsqueeze(0).unsqueeze(0).to(device)
@@ -192,22 +156,18 @@ def train_deblur_nglod(clear_img, blurred_img, psf, total_epochs=4000, lr=0.0001
     
     # 构建整个图像的坐标
     coords_full = build_image_coords(H, W, device)
-    if not use_nglod:
-        coords_full = pe(coords_full)
     
     all_losses = []
     
-    pbar = tqdm(total=total_epochs, desc="Training NGLOD", ncols=100, 
+    pbar = tqdm(total=args.epochs, desc="Training NGLOD", ncols=100, 
                 dynamic_ncols=True, leave=True, file=None, 
                 ascii=True, disable=False)
     start_time = time.time()
-    
-    for epoch in range(total_epochs):
-        if use_nglod:
-            pred_flat = model.sdf(coords_full, return_lst=False)  # [H*W, 1]
-        else:
-            pred_flat = model(coords_full)
-            
+
+    for epoch in range(args.epochs):
+
+        pred_flat = model.sdf(coords_full, return_lst=False)  # [H*W, 1]
+       
         predicted_clear = pred_flat.view(1, 1, H, W)
         
         predicted_blurred = F.conv2d(predicted_clear, psf_kernel, padding=psf_pad)
@@ -230,7 +190,7 @@ def train_deblur_nglod(clear_img, blurred_img, psf, total_epochs=4000, lr=0.0001
     
     pbar.close()
     
-    return model, all_losses, use_nglod
+    return model, all_losses
 
 def main():
     clear_img = download_simple_image()
@@ -246,7 +206,7 @@ def main():
     print(f"模糊图范围: [{blurred_img.min():.3f}, {blurred_img.max():.3f}]")
     
 
-    model, losses, use_nglod = train_deblur_nglod(
+    model, losses = train_deblur_nglod(
         clear_img, blurred_img, psf, 
         total_epochs=2000,  
         lr=1e-3,                          
@@ -256,15 +216,9 @@ def main():
     H, W = clear_img.shape
     
     with torch.no_grad():
-        coords = build_image_coords(H, W, device)
-        
-        if use_nglod:
-            pred_flat = model.sdf(coords, return_lst=False)  # [H*W, 1]
-        else:
-            pe = PosEncoding(L=6).to(device)
-            enc_coords = pe(coords)
-            pred_flat = model(enc_coords)  # [H*W, 1]
-            
+        coords = build_image_coords(H, W, device)   
+        pred_flat = model.sdf(coords, return_lst=False)  # [H*W, 1]
+             
         deblurred_tensor = pred_flat.view(1, 1, H, W)
         deblurred_img = deblurred_tensor.cpu().numpy().squeeze()
     
@@ -279,7 +233,7 @@ def main():
     axes[0, 1].axis('off')
     
     axes[0, 2].imshow(deblurred_img, cmap='gray', vmin=0, vmax=1)
-    model_type = "NGLOD" if use_nglod else "MLP"
+    model_type = "NGLOD" 
     axes[0, 2].set_title(f'{model_type} Deblurred Result')
     axes[0, 2].axis('off')
     
