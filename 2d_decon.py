@@ -101,23 +101,10 @@ def sample_random_patch(H: int, W: int, patch_h: int, patch_w: int):
     x0 = np.random.randint(0, max(1, W - patch_w + 1))
     return y0, x0
 
-
-def build_patch_coords(y0: int, x0: int, patch_h: int, patch_w: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """构建图像块的坐标 - 扩展为3D坐标供NGLOD使用"""
-    # 归一化到[-1, 1]范围
-    ys_patch = torch.linspace(-1.0 + 2.0 * y0 / (H - 1), -1.0 + 2.0 * (y0 + patch_h - 1) / (H - 1), steps=patch_h, device=device)
-    xs_patch = torch.linspace(-1.0 + 2.0 * x0 / (W - 1), -1.0 + 2.0 * (x0 + patch_w - 1) / (W - 1), steps=patch_w, device=device)
-    grid_y, grid_x = torch.meshgrid(ys_patch, xs_patch, indexing='ij')
-    # NGLOD 需要3D坐标，z设为0
-    coords = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1), torch.zeros_like(grid_x.reshape(-1))], dim=-1)  # [patch_h*patch_w, 3]
-    return coords
-
-
 def build_image_coords(height: int, width: int, device: torch.device) -> torch.Tensor:
     ys = torch.linspace(-1.0, 1.0, steps=height, device=device)
     xs = torch.linspace(-1.0, 1.0, steps=width, device=device)
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-    # NGLOD 需要3D坐标，z设为0
     coords = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1), torch.zeros_like(grid_x.reshape(-1))], dim=-1)  # [H*W, 3]
     return coords
 
