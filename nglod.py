@@ -8,6 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
 import sys
 import os
+import time
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
 from lib.models.OctreeSDF import OctreeSDF
 
@@ -48,32 +49,36 @@ class VolumeDataset(Dataset):
 
 class Args:
     def __init__(self):
+        # ===== 网络架构参数 =====
         self.net = 'OctreeSDF'
-        self.pos_enc = False          
         self.feature_dim = 32     
         self.feature_size = 4        
-        self.num_layers = 1         
-        self.num_lods = 5           
-        self.base_lod = 2            
-        self.ff_dim = -1              
-        self.ff_width = 16.0         
+        self.num_layers = 3         
         self.hidden_dim = 512      
-        self.pos_invariant = False   
-        self.joint_decoder = False   
-        self.feat_sum = False        
-        
-        # 基础参数
         self.input_dim = 3           
+        
+        # ===== LOD相关参数 =====
+        self.num_lods = 8           
+        self.base_lod = 2            
         self.interpolate = None    
-        
-        self.epochs = 8000          
-        self.batch_size = 100000       
-        self.grow_every = -1       
         self.growth_strategy = 'increase'  
+        self.grow_every = -1       
         
+        # ===== 位置编码参数 =====
+        self.pos_enc = False          
+        self.ff_dim = -1                    
+        
+        # ===== 训练参数 =====
+        self.epochs = 10000          
+        self.batch_size = 100000       
         self.optimizer = 'adam'      
         self.lr = 6e-4         
         self.loss = ['l1_loss']    # 使用L1损失
+        
+        # ===== 其他参数 =====
+        self.pos_invariant = False   
+        self.joint_decoder = False   
+        self.feat_sum = False        
         self.return_lst = True      
 
 def main():
@@ -89,7 +94,7 @@ def main():
     vol = vol / vol_max
     print("Normalized volume")
     dz, dy, dx = vol.shape
-    n_samples = 10000000  
+    n_samples = 1000000  
     epochs_per_batch = 10000  
     threshold = 0.03
 
@@ -112,12 +117,9 @@ def main():
         mlp_params += sum(p.numel() for p in decoder.parameters())
         print(f"LOD {i} MLP decoder parameters: {sum(p.numel() for p in decoder.parameters()):,}")
     
-    print(f"\nNGLOD Model Summary:")
     print(f"Total parameters: {total_params:,}")
     print(f"Octree feature parameters: {feature_params:,}")
     print(f"MLP decoder parameters: {mlp_params:,}")
-    print(f"Feature params / Total: {feature_params/total_params*100:.1f}%")
-    print(f"MLP params / Total: {mlp_params/total_params*100:.1f}%")
 
     model.train()
     
@@ -167,7 +169,13 @@ def main():
         dataset = VolumeDataset(coords, values, n_per_batch=args.batch_size, thresh=threshold)
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
-        for epoch in tqdm(range(epochs_per_batch), desc=f"Training batch {batch_idx + 1}"):
+        # 创建进度条
+        pbar = tqdm(total=epochs_per_batch, desc=f"Training batch {batch_idx + 1}", ncols=100, 
+                    dynamic_ncols=True, leave=True, file=None, 
+                    ascii=True, disable=False)
+        start_time = time.time()
+
+        for epoch in range(epochs_per_batch):
             # 检查是否需要增长LOD级别 - 确保只在达到指定间隔时增长一次
             if (current_epoch + epoch >= last_grow_epoch + lod_grow_interval and 
                 current_stage < max_stage and 
@@ -211,12 +219,23 @@ def main():
                 opt.step()
                 total_loss += loss.item() * batch_coords.size(0)   
                 
+            elapsed_time = time.time() - start_time
+            pbar.set_postfix({
+                'Loss': f'{total_loss:.6f}',
+                'Stage': f'{current_stage}',
+                'LODs': f'{loss_lods}',
+                'Grad': f'{total_norm:.2e}',
+                'Time': f'{elapsed_time:.1f}s'
+            })
+            pbar.update(1)
+            
             if (epoch + 1) % 10 == 0: 
                 print(f"Epoch {current_epoch + epoch + 1}: l1 loss = {total_loss:.6f}, Stage = {current_stage}, LODs = {loss_lods}, Gradient norm: {total_norm:.8e}")
             writer.add_scalar("Loss/l1", total_loss, current_epoch + epoch)
             writer.add_scalar("Training/current_stage", current_stage, current_epoch + epoch)
             writer.add_scalar("Gradient/norm", total_norm, current_epoch + epoch)
 
+        pbar.close()
         current_epoch += epochs_per_batch
         batch_idx += 1
         print(f"Completed batch {batch_idx}, total epochs: {current_epoch}")

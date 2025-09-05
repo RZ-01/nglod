@@ -68,7 +68,7 @@ class Args2D:
         
         # ===== 位置编码参数 =====
         self.pos_enc = False         # 是否使用位置编码 (True时输入维度变为39)
-        self.ff_dim = 0              # Fourier特征维度（0表示关闭，>0时优先于pos_enc）
+        self.ff_dim = -1              # Fourier特征维度（0表示关闭，>0时优先于pos_enc）
         self.ff_width = 16.0         # Fourier特征宽度 (控制频率范围)
         
         # ===== 训练参数 =====
@@ -203,8 +203,7 @@ def main():
             
             # 确保值的形状正确
             if len(batch_values.shape) == 1:
-                batch_values = batch_values.unsqueeze(-1)
-            
+                batch_values = batch_values.unsqueeze(-1)     
             # 前向传播
             if args.return_lst:
                 all_preds = model.sdf(batch_coords, return_lst=True)

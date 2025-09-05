@@ -87,7 +87,7 @@ class NGLODArgs:
         self.epochs = 2000
         self.grow_every = -1        # 每隔多少epoch增长LOD
         self.growth_strategy = 'increase'  # LOD增长策略
-        self.lr = 1e-3
+        self.lr = 2e-3
         
         # ===== 其他参数 =====
         self.pos_invariant = False   # 位置不变性
@@ -126,7 +126,7 @@ def apply_psf_torch(image, psf, device=None):
     
     return blurred
 
-def train_deblur_nglod(clear_img, blurred_img, psf, lr=0.0001):
+def train_deblur_nglod(clear_img, blurred_img, psf):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     H, W = clear_img.shape
@@ -136,7 +136,7 @@ def train_deblur_nglod(clear_img, blurred_img, psf, lr=0.0001):
 
     model = OctreeSDF(args).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, fused=True)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, fused=True)
 
     psf_kernel = torch.from_numpy(psf).float().unsqueeze(0).unsqueeze(0).to(device)
     psf_pad = psf.shape[0] // 2
@@ -183,21 +183,15 @@ def main():
     clear_img = download_simple_image()
     
     psf = create_G_psf(size=15, sigma=2.0)  
-    print(f"PSF类型: 高斯 (Gaussian), 尺寸: {psf.shape}, sigma: 2.0")
+    print(f"PSF: Gaussian, shape: {psf.shape}, sigma: 2.0")
 
     blurred_img = convolve(clear_img, psf, mode='constant')
     
     blur_strength = np.std(clear_img) / np.std(blurred_img) if np.std(blurred_img) > 0 else 1
     print(f"模糊强度比: {blur_strength:.2f} ")
-    print(f"原图范围: [{clear_img.min():.3f}, {clear_img.max():.3f}]")
-    print(f"模糊图范围: [{blurred_img.min():.3f}, {blurred_img.max():.3f}]")
     
 
-    model, losses = train_deblur_nglod(
-        clear_img, blurred_img, psf, 
-        total_epochs=2000,  
-        lr=1e-3,                          
-    )
+    model, losses = train_deblur_nglod(clear_img, blurred_img, psf)
     
     device = next(model.parameters()).device
     H, W = clear_img.shape
