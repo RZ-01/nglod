@@ -7,34 +7,43 @@ import torch.nn.functional as F
 import tifffile
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
+from lib.models.OctreeSDF import OctreeSDF
 
 torch.set_float32_matmul_precision('high')
 
-class PosEncoding(nn.Module):
-    def __init__(self, L: int = 6):
-        super().__init__()
-        self.L = L
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = [x]
-        for i in range(self.L):
-            for fn in (torch.sin, torch.cos):
-                features.append(fn((2.0 ** i) * np.pi * x))
-        return torch.cat(features, dim=-1)
-
-
-class SimpleMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 512, n_layers: int = 6):
-        super().__init__()
-        layers = []
-        for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.ReLU(inplace=True))
-        layers.append(nn.Linear(hidden_dim, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.leaky_relu(self.net(x))
+class NGLODArgs:
+    def __init__(self):
+        # ===== 网络架构参数 =====
+        self.net = 'OctreeSDF'
+        self.feature_dim = 32     
+        self.feature_size = 4        
+        self.num_layers = 1         
+        self.hidden_dim = 512      
+        self.input_dim = 3           
+        
+        # ===== LOD相关参数 =====
+        self.num_lods = 5           
+        self.base_lod = 2            
+        self.interpolate = None    
+        self.growth_strategy = 'increase'  
+        self.grow_every = -1       
+        
+        # ===== 位置编码参数 =====
+        self.pos_enc = False          
+        self.ff_dim = -1                    
+        
+        # ===== 训练参数 =====
+        self.optimizer = 'adam'      
+        self.loss = ['l1_loss']    
+        
+        # ===== 其他参数 =====
+        self.pos_invariant = False   
+        self.joint_decoder = False   
+        self.feat_sum = False        
+        self.return_lst = True  
 
 
 def sample_block_start_indices(volume_shape, block_shape):
@@ -66,7 +75,7 @@ def build_plane_coords_and_mask(z_index: int, y_start: int, x_start: int, height
     coords = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(-1, 3)
     return coords, mask
 
-def psf_finetune_step(model: nn.Module, pos_encoder: PosEncoding, norm_volume_np: np.ndarray,
+def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                       device: torch.device, writer: SummaryWriter, global_step: int,
                       psf_kernels: torch.Tensor, block_shape) -> torch.Tensor:
     model.train()
@@ -84,7 +93,6 @@ def psf_finetune_step(model: nn.Module, pos_encoder: PosEncoding, norm_volume_np
     ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
     ext_y0, ext_x0 = y0 - pad_h, x0 - pad_w
     
-    # 预测整个3D块的清晰体积（扩展版本）
     predicted_clear_extended_planes = []
     for u in range(bz):
         z_idx = z0 + u
@@ -92,9 +100,8 @@ def psf_finetune_step(model: nn.Module, pos_encoder: PosEncoding, norm_volume_np
             z_index=z_idx, y_start=ext_y0, x_start=ext_x0, height=ext_h, width=ext_w,
             full_dims=(vz, vy, vx), device=device,
         )
-        # 内联推理逻辑
-        enc_coords = pos_encoder(coords_flat_ext)
-        pred_flat_ext = model(enc_coords)
+        # 使用NGLOD进行推理
+        pred_flat_ext = model.sdf(coords_flat_ext)
         pred_plane_ext = pred_flat_ext.view(1, 1, ext_h, ext_w)
         pred_plane_ext = pred_plane_ext * mask_ext.to(pred_plane_ext.dtype).unsqueeze(0).unsqueeze(0)
         predicted_clear_extended_planes.append(pred_plane_ext)
@@ -129,7 +136,7 @@ def psf_finetune_step(model: nn.Module, pos_encoder: PosEncoding, norm_volume_np
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--volume_tif", type=str, default="./data/Mouse_Heart_Angle0_patch.tif")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/new_model_1_angle_0.pth")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")  # 改为NGLOD检查点
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=1e-6)
@@ -137,9 +144,8 @@ def main():
     parser.add_argument("--block_h", type=int, default=256)
     parser.add_argument("--block_w", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/new_model_psf_finetuned.pth")
-    parser.add_argument("--logdir", type=str, default="runs/psf_finetune")
-    #parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for model inference to save memory.")
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_finetuned.pth")
+    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_nglod")
     
     args = parser.parse_args()
 
@@ -154,15 +160,14 @@ def main():
     dz, dy, dx = vol_norm.shape
     print(f"Loaded volume {args.volume_tif} with shape (z,y,x) = {(dz, dy, dx)}. Normalized by max = {vol_max:.6f}")
 
-    pe = PosEncoding(L=6).to(device)
-    in_dim = 3 + 2 * 6 * 3
-    mlp = SimpleMLP(in_dim=in_dim).to(device)
+    nglod_args = NGLODArgs()
+    model = OctreeSDF(nglod_args).to(device)
 
-    print(f"Loading checkpoint: {args.checkpoint}")
+    print(f"Loading NGLOD checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    mlp.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'])
     
-    optimizer = torch.optim.Adam(mlp.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     writer = SummaryWriter(log_dir=args.logdir)
 
     psf = np.load(args.psf_npy).astype(np.float32)
@@ -174,26 +179,23 @@ def main():
     if psf_kernels.shape[0] != args.block_z:
         raise ValueError(f"PSF depth ({psf_kernels.shape[0]}) must match --block_z ({args.block_z})")
 
-    # print(f"Loss weights: lambda_tv={args.lambda_tv}, lambda_hf={args.lambda_hf}")
     block_shape = (args.block_z, args.block_h, args.block_w)
-    pbar = tqdm(range(args.steps), desc="PSF fine-tune")
+    pbar = tqdm(range(args.steps), desc="PSF fine-tune NGLOD")
     for step in pbar:
         optimizer.zero_grad(set_to_none=True)
         
         total_loss = psf_finetune_step(
-            model=mlp,
-            pos_encoder=pe,
+            model=model,
             norm_volume_np=vol_norm,
             device=device,
             writer=writer,
             global_step=step,
             psf_kernels=psf_kernels,
             block_shape=block_shape,
-            #chunk_size=args.chunk_size,
         )
         
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(mlp.parameters(), max_norm=50.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
         optimizer.step()
         
         if (step + 1) % 10 == 0:
@@ -201,13 +203,14 @@ def main():
 
     # Save new checkpoint
     save_obj = {
-        'model_state_dict': mlp.state_dict(),
+        'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'position_encoding': pe.state_dict(),
-        'total_loss': float(total_loss.item())
+        'total_loss': float(total_loss.item()),
+        'args': nglod_args,
+        'epoch': args.steps,
     }
     torch.save(save_obj, args.save_path)
-    print(f"Saved PSF-finetuned model to {args.save_path}")
+    print(f"Saved PSF-finetuned NGLOD model to {args.save_path}")
 
 
 if __name__ == "__main__":

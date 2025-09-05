@@ -92,8 +92,8 @@ def main():
     vol = vol / vol_max
     print("Normalized volume")
     dz, dy, dx = vol.shape
-    n_samples = 600000  
-    epochs_per_batch = 1000  
+    n_samples = 10000000  
+    epochs_per_batch = 10000  
     threshold = 0.03
 
     T = np.array([dx-1, dy-1, dz-1], dtype=np.float32)  
