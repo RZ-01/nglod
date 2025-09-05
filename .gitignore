@@ -7,3 +7,4 @@ compile_commands.json
 runs/
 checkpoints/
 nglod_out_new/
+*.png

@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import tifffile
@@ -7,7 +6,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
-import torch.nn.functional as F
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
@@ -52,29 +50,29 @@ class Args:
     def __init__(self):
         self.net = 'OctreeSDF'
         self.pos_enc = False          
-        self.feature_dim = 64       # 增加特征维度：32→128，提高表达能力
+        self.feature_dim = 32     
         self.feature_size = 4        
-        self.num_layers = 2          # 增加层数：1→2，提高网络深度
+        self.num_layers = 1         
         self.num_lods = 5           
         self.base_lod = 2            
-        self.ff_dim = 0              
-        self.ff_width = 16.0         # Fourier特征宽度
-        self.hidden_dim = 256        # 增加隐藏层维度：128→512，提高网络容量
+        self.ff_dim = -1              
+        self.ff_width = 16.0         
+        self.hidden_dim = 512      
         self.pos_invariant = False   
         self.joint_decoder = False   
         self.feat_sum = False        
         
         # 基础参数
         self.input_dim = 3           
-        self.interpolate = None     # LOD插值值（None表示不插值，或者设为0.0-1.0之间的浮点数）
-
-        self.epochs = 10000          
-        self.batch_size = 100000        # 保持大批量训练
-        self.grow_every = 1000       # 增加LOD增长间隔：1000→1500，让每个LOD训练更充分
+        self.interpolate = None    
+        
+        self.epochs = 8000          
+        self.batch_size = 100000       
+        self.grow_every = -1       
         self.growth_strategy = 'increase'  
         
         self.optimizer = 'adam'      
-        self.lr = 1e-4           
+        self.lr = 6e-4         
         self.loss = ['l1_loss']    # 使用L1损失
         self.return_lst = True      
 
@@ -82,7 +80,7 @@ def main():
     # 配置并实例化 NGLOD 模型
     args = Args()
     
-    vol = tifffile.imread('Mouse_Heart_Angle0_patch.tif')
+    vol = tifffile.imread('../data/Mouse_Heart_Angle0_patch.tif')
     print("Loaded volume")
 
     # Keep original max for de-normalization in PSF fine-tuning
@@ -91,9 +89,9 @@ def main():
     vol = vol / vol_max
     print("Normalized volume")
     dz, dy, dx = vol.shape
-    n_samples = 600000  
-    epochs_per_batch = 1000  
-    threshold = 0.02
+    n_samples = 10000000  
+    epochs_per_batch = 10000  
+    threshold = 0.03
 
     T = np.array([dx-1, dy-1, dz-1], dtype=np.float32)  
     
@@ -103,7 +101,24 @@ def main():
     
     model = OctreeSDF(args).to(device)
     
-    # 设置训练模式
+    # Print parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    feature_params = 0
+    for i, feature_vol in enumerate(model.features):
+        feature_params += sum(p.numel() for p in feature_vol.parameters())
+        print(f"LOD {i} feature volume parameters: {sum(p.numel() for p in feature_vol.parameters()):,}")
+    mlp_params = 0
+    for i, decoder in enumerate(model.louts):
+        mlp_params += sum(p.numel() for p in decoder.parameters())
+        print(f"LOD {i} MLP decoder parameters: {sum(p.numel() for p in decoder.parameters()):,}")
+    
+    print(f"\nNGLOD Model Summary:")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Octree feature parameters: {feature_params:,}")
+    print(f"MLP decoder parameters: {mlp_params:,}")
+    print(f"Feature params / Total: {feature_params/total_params*100:.1f}%")
+    print(f"MLP params / Total: {mlp_params/total_params*100:.1f}%")
+
     model.train()
     
     # 初始化LOD训练策略 - 这是NGLOD的关键！
@@ -112,7 +127,6 @@ def main():
     
     # TRAIN - 使用args中的参数
     opt = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     
     # 创建checkpoints目录
     os.makedirs('checkpoints', exist_ok=True)
@@ -161,9 +175,6 @@ def main():
                 current_stage += 1
                 last_grow_epoch = current_epoch + epoch
                 print(f"\nEpoch {current_epoch + epoch}: Growing to stage {current_stage} (training LODs: {get_loss_lods(current_stage)})")
-                opt = optim.Adam(model.parameters(), lr=args.lr)
-                remaining_steps = total_epochs - (current_epoch + epoch)
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=remaining_steps, eta_min=1e-6)
             
             # 获取当前要训练的LOD级别
             loss_lods = get_loss_lods(current_stage, args.growth_strategy)
@@ -195,7 +206,7 @@ def main():
 
                 opt.zero_grad()
                 loss.backward()
-                total_norm = clip_grad_norm_(model.parameters(), max_norm=10.0)
+                total_norm = clip_grad_norm_(model.parameters(), max_norm=50.0)
 
                 opt.step()
                 total_loss += loss.item() * batch_coords.size(0)   
@@ -205,8 +216,6 @@ def main():
             writer.add_scalar("Loss/l1", total_loss, current_epoch + epoch)
             writer.add_scalar("Training/current_stage", current_stage, current_epoch + epoch)
             writer.add_scalar("Gradient/norm", total_norm, current_epoch + epoch)
-            writer.add_scalar("Learning/rate", scheduler.get_last_lr()[0], current_epoch + epoch)
-            scheduler.step()
 
         current_epoch += epochs_per_batch
         batch_idx += 1
