@@ -14,7 +14,9 @@ from lib.models.OctreeSDF import OctreeSDF
 
 torch.set_float32_matmul_precision('high')
 
-class NGLODArgs:
+
+class Args:
+    """NGLOD原始参数类 - 用于加载nglod.py保存的检查点"""
     def __init__(self):
         # ===== 网络架构参数 =====
         self.net = 'OctreeSDF'
@@ -36,14 +38,35 @@ class NGLODArgs:
         self.ff_dim = -1                    
         
         # ===== 训练参数 =====
+        self.epochs = 10000          
+        self.batch_size = 100000       
         self.optimizer = 'adam'      
+        self.lr = 6e-4         
         self.loss = ['l1_loss']    
         
         # ===== 其他参数 =====
         self.pos_invariant = False   
         self.joint_decoder = False   
         self.feat_sum = False        
-        self.return_lst = True  
+        self.return_lst = True
+
+def load_nglod_model_from_checkpoint(checkpoint_path, device):
+    print(f"Loading NGLOD checkpoint: {checkpoint_path}")
+    
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    if 'args' in ckpt:
+        nglod_args = ckpt['args']
+        print("load nglod args from checkpoint")
+    else:
+        print("no args in checkpoint, use default nglod args")
+        nglod_args = Args()  
+    
+    model = OctreeSDF(nglod_args).to(device)
+    
+    model.load_state_dict(ckpt['model_state_dict'])
+    
+    return model, nglod_args  
 
 
 def sample_block_start_indices(volume_shape, block_shape):
@@ -119,15 +142,12 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
             simulated_focal_plane += contribution
         simulated_focal_planes.append(simulated_focal_plane)
     
-    # 准备目标3D块
     target_block_np = norm_volume_np[z0:z0+bz, y0:y0+by, x0:x0+bx]
     target_block = torch.from_numpy(target_block_np).to(device=device, dtype=torch.float32)
     
-    # 将模拟的焦平面堆叠成3D张量
     simulated_block = torch.cat(simulated_focal_planes, dim=0)  # [bz, 1, by, bx]
     simulated_block = simulated_block.squeeze(1)  # [bz, by, bx]
     
-    # 计算3D块的MSE loss
     total_loss = F.mse_loss(simulated_block, target_block)
     
     writer.add_scalar("PSF_FT/Total_Loss_MSE_3D", total_loss.item(), global_step)
@@ -135,16 +155,16 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--volume_tif", type=str, default="./data/Mouse_Heart_Angle0_patch.tif")
+    parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")  # 改为NGLOD检查点
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
-    parser.add_argument("--steps", type=int, default=50000)
+    parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--block_z", type=int, default=25)
     parser.add_argument("--block_h", type=int, default=256)
     parser.add_argument("--block_w", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_finetuned.pth")
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_finetuned_0.pth")
     parser.add_argument("--logdir", type=str, default="runs/psf_finetune_nglod")
     
     args = parser.parse_args()
@@ -160,12 +180,7 @@ def main():
     dz, dy, dx = vol_norm.shape
     print(f"Loaded volume {args.volume_tif} with shape (z,y,x) = {(dz, dy, dx)}. Normalized by max = {vol_max:.6f}")
 
-    nglod_args = NGLODArgs()
-    model = OctreeSDF(nglod_args).to(device)
-
-    print(f"Loading NGLOD checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
+    model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     writer = SummaryWriter(log_dir=args.logdir)
@@ -198,16 +213,26 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
         optimizer.step()
         
-        if (step + 1) % 10 == 0:
-            pbar.set_postfix(total_loss=f"{total_loss.item():.6f}")
+        if (step + 1) % 3 == 0:
+            pbar.set_postfix(total_loss=f"{total_loss.item():.12f}")
 
     # Save new checkpoint
     save_obj = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'total_loss': float(total_loss.item()),
-        'args': nglod_args,
+        'nglod_args': nglod_args,  # NGLOD的网络架构参数
+        'psf_finetune_config': {   # PSF微调的训练配置
+            'lr': args.lr,
+            'steps': args.steps,
+            'block_z': args.block_z,
+            'block_h': args.block_h,
+            'block_w': args.block_w,
+            'psf_npy': args.psf_npy,
+            'volume_tif': args.volume_tif,
+        },
         'epoch': args.steps,
+        'finetune_type': 'psf',  # 标记这是PSF微调的检查点
     }
     torch.save(save_obj, args.save_path)
     print(f"Saved PSF-finetuned NGLOD model to {args.save_path}")
