@@ -66,28 +66,20 @@ def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_features=Tr
     model.load_state_dict(ckpt['model_state_dict'])
     
     if freeze_features:
-        print("=== 冻结Features参数，只训练Decoder ===")
-        # 冻结所有feature参数
         for name, param in model.named_parameters():
-            if 'features' in name:
+            if 'louts' in name:
                 param.requires_grad = False
                 
-        # 统计可训练参数
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         frozen_params = total_params - trainable_params
         
-        print(f"总参数: {total_params:,}")
-        print(f"可训练参数 (Decoders): {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
-        print(f"冻结参数 (Features): {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
+        print(f"Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        print(f"Freezed: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
         
-        # 验证只有decoder参数是可训练的
         trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
-        print(f"可训练参数列表 (前5个): {trainable_names[:5]}")
     else:
-        print("=== 训练所有参数 ===")
         total_params = sum(p.numel() for p in model.parameters())
-        print(f"总参数: {total_params:,} (全部可训练)")
     
     return model, nglod_args  
 
@@ -184,13 +176,12 @@ def main():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--block_z", type=int, default=25)
-    parser.add_argument("--block_h", type=int, default=256)
-    parser.add_argument("--block_w", type=int, default=256)
+    parser.add_argument("--block_h", type=int, default=512)
+    parser.add_argument("--block_w", type=int, default=512)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_finetuned_decoder_only.pth")
     parser.add_argument("--logdir", type=str, default="runs/psf_finetune_nglod_decoder")
-    parser.add_argument("--freeze_features", action="store_true", default=True, 
-                       help="冻结feature参数，只训练decoder")
+    parser.add_argument("--freeze_features", action="store_true", default=True)
     
     
     args = parser.parse_args()
@@ -206,7 +197,7 @@ def main():
     dz, dy, dx = vol_norm.shape
     print(f"Loaded volume {args.volume_tif} with shape (z,y,x) = {(dz, dy, dx)}. Normalized by max = {vol_max:.6f}")
 
-    model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, freeze_features)
+    model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, args.freeze_features)
     
     # 只对可训练参数创建优化器
     trainable_params = [p for p in model.parameters() if p.requires_grad]
