@@ -22,7 +22,7 @@ class Args:
         self.feature_dim = 64       # 增加特征维度：32→128，提高表达能力
         self.feature_size = 4        
         self.num_layers = 2          # 增加层数：1→2，提高网络深度
-        self.num_lods = 5           
+        self.num_lods = 7           
         self.base_lod = 2            
         self.ff_dim = 0              
         self.ff_width = 16.0         # Fourier特征宽度
@@ -33,17 +33,17 @@ class Args:
         
         # 基础参数
         self.input_dim = 3           
-        self.interpolate = None      # LOD插值值（None表示不插值，或者设为0.0-1.0之间的浮点数）
+        self.interpolate = 'linear'      # LOD插值值
         
         self.epochs = 10000          
-        self.batch_size = 100000        # 保持大批量训练
-        self.grow_every = 1000       # 增加LOD增长间隔：1000→1500，让每个LOD训练更充分
+        self.batch_size = 300000        # 保持大批量训练
+        self.grow_every = 2000       # 增加LOD增长间隔：1000→1500，让每个LOD训练更充分
         self.growth_strategy = 'increase'  
         
         self.optimizer = 'adam'      
-        self.lr = 1e-4           
+        self.lr = 6e-4           
         self.loss = ['l1_loss']    # 使用L1损失
-        self.return_lst = True            
+        self.return_lst = True              
 
 
 def read_volume_shape(tif_path: str):
@@ -103,13 +103,13 @@ def choose_random_slices(dz: int, num_slices: int, seed: int) -> List[int]:
 
 def main():
     parser = argparse.ArgumentParser(description="Infer random z-slices from a trained NGLOD occupancy network and save as float32 TIF")
-    parser.add_argument("--volume_tif", type=str, default="Mouse_Heart_Angle0_patch.tif", help="Path to the reference volume (for shape)")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth", help="Path to the trained checkpoint .pth")
-    parser.add_argument("--out_dir", type=str, default="nglod_out_new", help="Directory to save inferred TIFs")
+    parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif", help="Path to the reference volume (for shape)")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_psf_finetuned.pth", help="Path to the trained checkpoint .pth")
+    parser.add_argument("--out_dir", type=str, default="nglod_out_psf", help="Directory to save inferred TIFs")
     parser.add_argument("--num_slices", type=int, default=5, help="How many random z-slices to infer")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for selecting slices")
-    parser.add_argument("--lod_level", type=int, default=0, help="Specific LOD level to use (0=coarse, 4=fine). None=auto select highest")
+    parser.add_argument("--lod_level", type=int, default=None, help="Specific LOD level to use (0=coarse, 4=fine). None=auto select highest")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -126,7 +126,7 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
     # Reconstruct NGLOD model from saved args
-    saved_args = ckpt.get('args', None)
+    saved_args = ckpt.get('nglod_args', None)
     model = OctreeSDF(saved_args).to(device)
     
     # Load model weights
@@ -158,8 +158,9 @@ def main():
             pred_plane = pred_flat.view(dy, dx)
             pred_plane = pred_plane.clamp(0.0, 1.0)
 
-            # Save as float32 in [0,1]
-            out_img = pred_plane.detach().cpu().numpy().astype(np.float32)
+            # Convert to uint16 range [0, 65535]
+            out_img = pred_plane.detach().cpu().numpy()
+            out_img = (out_img * 65535).astype(np.uint16)
 
             out_path = os.path.join(args.out_dir, f"nglod_infer_z{z_idx:05d}_lod{use_lod}.tif")
             tifffile.imwrite(out_path, out_img)
