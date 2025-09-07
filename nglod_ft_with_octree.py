@@ -15,7 +15,6 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
 from lib.models.OctreeSDF import OctreeSDF
-from nglod_octree_analyzer import NGLODOctreeAnalyzer
 
 torch.set_float32_matmul_precision('high')
 
@@ -48,22 +47,16 @@ class Args:
 
 
 class OctreeNodeTrainer:
-    """Octree Node级别的训练管理器"""
-    
     def __init__(self, model, device):
         self.model = model
         self.device = device
-        self.analyzer = NGLODOctreeAnalyzer(model)
+        self.lod_info = {}
+        self._analyze_nglod_structure()
+        node_sizes = [2, 3, 4, 6, 8]  # 对应LOD 0-4的节点大小
+        self.all_nodes = self._generate_all_nodes(node_sizes)
         
-        # 获取所有nodes的训练调度
-        # 使用更合理的node大小：从细到粗
-        node_sizes = [2, 3, 4, 6, 8]  # 对应LOD 0-4
-        self.all_nodes = self.analyzer.get_all_nodes(node_sizes)
+        print(f" {len(self.all_nodes)} octree nodes in total")
         
-        print(f"=== Octree Node训练调度初始化 ===")
-        print(f"总共 {len(self.all_nodes)} 个octree nodes")
-        
-        # 按LOD分组统计
         lod_counts = {}
         for node in self.all_nodes:
             lod = node['lod']
@@ -72,15 +65,73 @@ class OctreeNodeTrainer:
         for lod, count in lod_counts.items():
             print(f"LOD {lod}: {count} nodes")
     
+    def _analyze_nglod_structure(self):
+        
+        for lod_idx in range(self.model.num_lods):
+            feature_volume = self.model.features[lod_idx]
+            fm_shape = feature_volume.fm.shape  # [1, fdim, fsize+1, fsize+1, fsize+1]
+            
+            # 计算实际的空间维度
+            # 根据OctreeSDF源码，每个LOD的大小是: 2^(i+base_lod)
+            spatial_size = 2**(lod_idx + self.model.args.base_lod)
+            spatial_dims = [spatial_size, spatial_size, spatial_size]  # [z, y, x]
+            
+            self.lod_info[lod_idx] = {
+                'feature_volume': feature_volume,
+                'fm_shape': fm_shape,
+                'spatial_dims': spatial_dims,
+                'spatial_size': spatial_size,
+                'total_voxels': spatial_size ** 3,
+                'total_params': feature_volume.fm.numel()
+            }
+
+            print(f"LOD {lod_idx}: spatial size {spatial_size}³, params {self.lod_info[lod_idx]['total_params']:,}")
+
+    def _generate_all_nodes(self, node_sizes):
+        all_nodes = []
+        
+        for lod_idx in range(self.model.num_lods):
+            if lod_idx < len(node_sizes):
+                node_size = node_sizes[lod_idx]
+            else:
+                node_size = node_sizes[-1]
+            
+            lod_data = self.lod_info[lod_idx]
+            spatial_size = lod_data['spatial_size']
+            
+            nodes_per_dim = max(1, spatial_size // node_size)
+            
+            for z_idx in range(nodes_per_dim):
+                for y_idx in range(nodes_per_dim):
+                    for x_idx in range(nodes_per_dim):
+                        # 计算节点的空间范围
+                        z_start = z_idx * node_size
+                        z_end = min((z_idx + 1) * node_size, spatial_size)
+                        y_start = y_idx * node_size
+                        y_end = min((y_idx + 1) * node_size, spatial_size)
+                        x_start = x_idx * node_size
+                        x_end = min((x_idx + 1) * node_size, spatial_size)
+                        
+                        node_info = {
+                            'lod': lod_idx,
+                            'node_idx': (z_idx, y_idx, x_idx),
+                            'spatial_range': {
+                                'z': (z_start, z_end),
+                                'y': (y_start, y_end),
+                                'x': (x_start, x_end)
+                            },
+                            'actual_size': (z_end - z_start, y_end - y_start, x_end - x_start)
+                        }
+                        all_nodes.append(node_info)
+        
+        return all_nodes
+    
     def freeze_all_features(self):
-        """冻结所有feature参数"""
         for name, param in self.model.named_parameters():
             if 'features' in name:
                 param.requires_grad = False
     
     def activate_node(self, node_idx):
-        """激活指定node的训练，冻结其他所有features"""
-        # 先冻结所有features
         self.freeze_all_features()
         
         if node_idx >= len(self.all_nodes):
@@ -89,50 +140,33 @@ class OctreeNodeTrainer:
         node_info = self.all_nodes[node_idx]
         lod_level = node_info['lod']
         
-        # 重新激活整个LOD级别的feature volume
-        # 注意：由于PyTorch的限制，我们无法只训练feature volume的一部分
-        # 所以我们训练整个LOD级别，但可以通过loss masking来聚焦特定区域
+        # 训练整个LOD级别，但可以通过loss masking来聚焦特定区域
         feature_volume = self.model.features[lod_level]
         for param in feature_volume.parameters():
             param.requires_grad = True
         
-        # 统计当前可训练参数
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
-        
-        print(f"激活 Node {node_idx} (LOD {lod_level})")
-        print(f"  空间范围: {node_info['spatial_range']}")
-        print(f"  实际大小: {node_info['actual_size']}")
-        print(f"  可训练参数: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.1f}%)")
-        
+
+        print(f"Activate Node {node_idx} (LOD {lod_level})")
+        print(f"  Spatial Range: {node_info['spatial_range']}")
+        print(f"  Actual Size: {node_info['actual_size']}")
+        print(f"  Trainable Params: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.1f}%)")
+
         return node_info
     
     def get_node_spatial_mask(self, node_info, coords):
-        """
-        为指定node生成空间mask，用于loss加权
-        
-        Args:
-            node_info: node信息
-            coords: 坐标张量 [N, 3]，范围在[-1, 1]
-            
-        Returns:
-            mask: [N] 布尔张量，True表示坐标在node内
-        """
         lod_level = node_info['lod']
         spatial_range = node_info['spatial_range']
         
-        # 获取LOD级别的空间分辨率
-        lod_data = self.analyzer.lod_info[lod_level]
-        spatial_dims = lod_data['spatial_dims']  # [z, y, x]
+        lod_data = self.lod_info[lod_level]
+        spatial_size = lod_data['spatial_size']
         
-        # 将归一化坐标[-1,1]转换为voxel索引
-        # coords: [N, 3] where coords[i] = [x, y, z] in [-1, 1]
         voxel_coords = (coords + 1) * 0.5  # 转换到[0, 1]
-        voxel_coords[:, 0] *= (spatial_dims[2] - 1)  # x
-        voxel_coords[:, 1] *= (spatial_dims[1] - 1)  # y  
-        voxel_coords[:, 2] *= (spatial_dims[0] - 1)  # z
+        voxel_coords[:, 0] *= (spatial_size - 1)  # x
+        voxel_coords[:, 1] *= (spatial_size - 1)  # y  
+        voxel_coords[:, 2] *= (spatial_size - 1)  # z
         
-        # 检查是否在node的空间范围内
         x_in = (voxel_coords[:, 0] >= spatial_range['x'][0]) & (voxel_coords[:, 0] < spatial_range['x'][1])
         y_in = (voxel_coords[:, 1] >= spatial_range['y'][0]) & (voxel_coords[:, 1] < spatial_range['y'][1])
         z_in = (voxel_coords[:, 2] >= spatial_range['z'][0]) & (voxel_coords[:, 2] < spatial_range['z'][1])
@@ -142,7 +176,6 @@ class OctreeNodeTrainer:
 
 
 def load_nglod_model_from_checkpoint(checkpoint_path, device):
-    """加载NGLOD模型"""
     print(f"Loading NGLOD checkpoint: {checkpoint_path}")
     
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -194,9 +227,7 @@ def psf_finetune_step_with_node_focus(model: nn.Module, node_trainer: OctreeNode
                                     current_node_info, norm_volume_np: np.ndarray,
                                     device: torch.device, writer: SummaryWriter, global_step: int,
                                     psf_kernels: torch.Tensor, block_shape) -> torch.Tensor:
-    """
-    带有node聚焦的PSF微调步骤
-    """
+
     model.train()
 
     vz, vy, vx = norm_volume_np.shape
@@ -212,7 +243,6 @@ def psf_finetune_step_with_node_focus(model: nn.Module, node_trainer: OctreeNode
     ext_y0, ext_x0 = y0 - pad_h, x0 - pad_w
     
     predicted_clear_extended_planes = []
-    total_node_loss = 0.0
     total_coords_count = 0
     
     for u in range(bz):
@@ -221,9 +251,6 @@ def psf_finetune_step_with_node_focus(model: nn.Module, node_trainer: OctreeNode
             z_index=z_idx, y_start=ext_y0, x_start=ext_x0, height=ext_h, width=ext_w,
             full_dims=(vz, vy, vx), device=device,
         )
-        
-        # 计算当前node的空间mask
-        node_mask = node_trainer.get_node_spatial_mask(current_node_info, coords_flat_ext)
         
         # 使用NGLOD进行推理
         pred_flat_ext = model.sdf(coords_flat_ext)
@@ -252,23 +279,47 @@ def psf_finetune_step_with_node_focus(model: nn.Module, node_trainer: OctreeNode
     simulated_block = torch.cat(simulated_focal_planes, dim=0)
     simulated_block = simulated_block.squeeze(1)
     
-    # 计算loss
-    total_loss = F.mse_loss(simulated_block, target_block)
-    
-    # 记录到tensorboard
+    coords_for_loss_mask = []
+    for u in range(bz):
+        z_idx = z0+u
+        coords_inner, _ = build_plane_coords_and_mask(
+            z_index=z_idx, y_start=y0, x_start=x0, height=by, width=bx,
+            full_dims=(vz, vy, vx), device=device,
+        )
+        coords_for_loss_mask.append(coords_inner)
+        
+    all_inner_coords = torch.cat(coords_for_loss_mask, dim=0)
+
+    node_mask = node_trainer.get_node_spatial_mask(current_node_info, all_inner_coords)
+    node_mask = node_mask.view(bz, by, bx) # 将1D掩码重塑为block的3D形状
+
+    error = simulated_block - target_block
+    masked_error = error * node_mask.float() # 应用掩码
+        
+    if node_mask.sum() > 0:
+        total_loss = (masked_error**2).sum() / node_mask.sum()
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        
+    num_masked_pixels = node_mask.sum().item()
+    total_pixels = node_mask.numel()
+    mask_ratio = num_masked_pixels / total_pixels
+        
     writer.add_scalar("PSF_FT/Total_Loss_MSE_3D", total_loss.item(), global_step)
     writer.add_scalar(f"PSF_FT/Node_LOD{current_node_info['lod']}_Loss", total_loss.item(), global_step)
-    
+    writer.add_scalar(f"PSF_FT/Node_{current_node_info['lod']}_Mask_Ratio", mask_ratio, global_step)
+        
     return total_loss
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NGLOD高级PSF微调：按Octree Node渐进式训练")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
-    parser.add_argument("--steps_per_node", type=int, default=100, help="每个node训练的步数")
-    parser.add_argument("--max_nodes", type=int, default=50, help="最大训练的node数量")
+    parser.add_argument("--steps_per_node", type=int, default=100, help="epochs per node")
+    parser.add_argument("--max_nodes", type=int, default=50, help="maximum number of nodes to train")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--block_z", type=int, default=25)
     parser.add_argument("--block_h", type=int, default=128)
@@ -312,24 +363,20 @@ def main():
         raise ValueError(f"PSF depth ({psf_kernels.shape[0]}) must match --block_z ({args.block_z})")
 
     block_shape = (args.block_z, args.block_h, args.block_w)
-    
-    print(f"\n=== 开始Octree Node渐进式训练 ===")
-    print(f"将训练 {max_nodes} 个nodes，每个node训练 {args.steps_per_node} 步")
-    
+
+    print(f"training {max_nodes} nodes, each one {args.steps_per_node} steps")
+
     global_step = 0
     
     # 逐个训练每个node
     for node_idx in range(max_nodes):
-        print(f"\n--- 训练 Node {node_idx}/{max_nodes-1} ---")
+        print(f"\n--- training Node {node_idx}/{max_nodes-1} ---")
         
-        # 激活当前node
         current_node_info = node_trainer.activate_node(node_idx)
         
-        # 为当前node创建优化器（只优化可训练参数）
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
         
-        # 训练当前node
         node_pbar = tqdm(range(args.steps_per_node), 
                         desc=f"Node {node_idx} LOD{current_node_info['lod']}")
         
@@ -362,7 +409,6 @@ def main():
         
         node_pbar.close()
 
-    # 保存最终模型
     save_obj = {
         'model_state_dict': model.state_dict(),
         'nglod_args': nglod_args,
@@ -383,10 +429,7 @@ def main():
     }
     torch.save(save_obj, args.save_path)
     
-    print(f"\n=== 训练完成 ===")
-    print(f"训练了 {max_nodes} 个octree nodes")
-    print(f"总训练步数: {global_step}")
-    print(f"已保存模型到: {args.save_path}")
+    print(f"saved to {args.save_path}")
 
 
 if __name__ == "__main__":
