@@ -59,23 +59,6 @@ def read_volume_shape(tif_path: str):
         return tuple(int(x) for x in vol.shape)
 
 
-def get_training_block_position(volume_shape, block_shape):
-    vz, vy, vx = volume_shape
-    bz, by, bx = block_shape
-    
-    z0 = 300  
-    if z0 + bz > vz:
-        z0 = max(0, vz - bz)
-        print(f"Warning: z block adjusted to fit within volume bounds: z0={z0}")
-    
-    y0 = max(0, vy - by)  
-    x0 = max(0, vx - bx) 
-
-    return z0, y0, x0
-
-
-
-
 def build_plane_normalized_coords(z_index: int, height: int, width: int, full_dims, device: torch.device) -> torch.Tensor:
     vz, vy, vx = full_dims
     ys = torch.arange(0, height, device=device, dtype=torch.float32)
