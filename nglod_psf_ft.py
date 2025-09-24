@@ -12,8 +12,6 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
 from lib.models.OctreeSDF import OctreeSDF
 
-torch.set_float32_matmul_precision('high')
-
 
 class Args:
     """NGLOD原始参数类 - 用于加载nglod.py保存的检查点"""
@@ -81,16 +79,55 @@ def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
     else:
         total_params = sum(p.numel() for p in model.parameters())
     
-    return model, nglod_args  
+    return model, nglod_args
+
+def load_psf_finetuned_checkpoint(checkpoint_path, device, freeze_mlp=True):
+    print(f"Loading PSF-finetuned checkpoint: {checkpoint_path}")
+    
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Check if this is a PSF-finetuned checkpoint
+    if 'finetune_type' not in ckpt or ckpt['finetune_type'] != 'psf':
+        raise ValueError(f"Checkpoint {checkpoint_path} is not a PSF-finetuned checkpoint")
+    
+    if 'nglod_args' in ckpt:
+        nglod_args = ckpt['nglod_args']
+        print("Loaded nglod args from PSF-finetuned checkpoint")
+    else:
+        print("No nglod args in checkpoint, using default")
+        nglod_args = Args()
+    
+    model = OctreeSDF(nglod_args).to(device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    
+    if freeze_mlp:
+        for name, param in model.named_parameters():
+            if 'louts' in name:
+                param.requires_grad = False
+                
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        
+        print(f"Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        print(f"Freezed: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
+    else:
+        total_params = sum(p.numel() for p in model.parameters())
+    
+    return model, nglod_args, ckpt  
 
 
 def sample_block_start_indices(volume_shape, block_shape):
+    """随机选择一个块"""
     vz, vy, vx = volume_shape
     bz, by, bx = block_shape
+    
+    # 随机选择z位置
     z0 = np.random.randint(0, max(1, vz - bz + 1))
+    # 随机选择y和x位置
     y0 = np.random.randint(0, max(1, vy - by + 1))
     x0 = np.random.randint(0, max(1, vx - bx + 1))
-    
+
     return z0, y0, x0
 
 def build_plane_coords_and_mask(z_index: int, y_start: int, x_start: int, height: int, width: int,
@@ -115,7 +152,7 @@ def build_plane_coords_and_mask(z_index: int, y_start: int, x_start: int, height
 
 def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                       device: torch.device, writer: SummaryWriter, global_step: int,
-                      psf_kernels: torch.Tensor, block_shape) -> torch.Tensor:
+                      psf_kernels: torch.Tensor, block_shape, block_coords=None) -> torch.Tensor:
     model.train()
 
     vz, vy, vx = norm_volume_np.shape
@@ -123,10 +160,14 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     kH, kW = psf_kernels.shape[1], psf_kernels.shape[2]
     pad_h, pad_w = kH // 2, kW // 2
 
-    if psf_kernels.shape[0] != bz:
-        raise ValueError(f"PSF depth {psf_kernels.shape[0]} must equal block depth {bz}")
+    # PSF的深度和中心索引
+    psf_depth = psf_kernels.shape[0]
+    psf_center = psf_depth // 2  # PSF的中心层索引
 
-    z0, y0, x0 = sample_block_start_indices((vz, vy, vx), (bz, by, bx))
+    if block_coords is not None:
+        z0, y0, x0 = block_coords
+    else:
+        z0, y0, x0 = sample_block_start_indices((vz, vy, vx), (bz, by, bx))
 
     ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
     ext_y0, ext_x0 = y0 - pad_h, x0 - pad_w
@@ -150,11 +191,21 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
         simulated_focal_plane = torch.zeros((1, 1, by, bx), device=device)
         for u in range(bz):
             clear_extended_slice = predicted_clear_extended_planes[u]
-            kernel = psf_kernels[abs(u - focal_z)]  # 使用距离对应的PSF核
-            # Add dimensions to make kernel 4D: (out_channels, in_channels, height, width)
-            kernel = kernel.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, height, width)
-            contribution = F.conv2d(clear_extended_slice, kernel, padding=0)
-            simulated_focal_plane += contribution
+            
+            # 计算当前clear slice (u) 到focal plane (focal_z) 的距离
+            z_distance = u - focal_z
+            # PSF核的索引：中心层对应距离0，向上下扩展
+            psf_idx = psf_center + z_distance
+            
+            # 只有在PSF影响范围内的层才有贡献
+            if 0 <= psf_idx < psf_depth:
+                kernel = psf_kernels[psf_idx]
+                # Add dimensions to make kernel 4D: (out_channels, in_channels, height, width)
+                kernel = kernel.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, height, width)
+                contribution = F.conv2d(clear_extended_slice, kernel, padding=0)
+                simulated_focal_plane += contribution
+            # 超出PSF影响范围的层对当前焦平面没有贡献，跳过
+                
         simulated_focal_planes.append(simulated_focal_plane)
     
     target_block_np = norm_volume_np[z0:z0+bz, y0:y0+by, x0:x0+bx]
@@ -163,9 +214,9 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     simulated_block = torch.cat(simulated_focal_planes, dim=0)  # [bz, 1, by, bx]
     simulated_block = simulated_block.squeeze(1)  # [bz, by, bx]
     
-    total_loss = F.mse_loss(simulated_block, target_block)
+    total_loss = F.l1_loss(simulated_block, target_block)
     
-    writer.add_scalar("PSF_FT/Total_Loss_MSE_3D", total_loss.item(), global_step)
+    writer.add_scalar("PSF_FT/Total_Loss_L1_3D", total_loss.item(), global_step)
     return total_loss
 
 def main():
@@ -173,15 +224,17 @@ def main():
     parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")  # 改为NGLOD检查点
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
-    parser.add_argument("--steps", type=int, default=5000)
-    parser.add_argument("--lr", type=float, default=1e-6)
-    parser.add_argument("--block_z", type=int, default=25)
-    parser.add_argument("--block_h", type=int, default=512)
-    parser.add_argument("--block_w", type=int, default=512)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=6e-3)
+    parser.add_argument("--block_z", type=int, default=230)
+    parser.add_argument("--block_h", type=int, default=266)
+    parser.add_argument("--block_w", type=int, default=266)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_finetuned_decoder_only.pth")
-    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_nglod_decoder")
-    parser.add_argument("--freeze_mlp", action="store_true", default=True)
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_finetuned_ext.pth")
+    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_nglod_new")
+    parser.add_argument("--freeze_mlp", action="store_true", default=False)
+    parser.add_argument("--load_from_checkpoint", type=str, default=None, 
+                        help="Path to PSF-finetuned checkpoint to resume from")
     
     
     args = parser.parse_args()
@@ -197,27 +250,58 @@ def main():
     dz, dy, dx = vol_norm.shape
     print(f"Loaded volume {args.volume_tif} with shape (z,y,x) = {(dz, dy, dx)}. Normalized by max = {vol_max:.6f}")
 
-    model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, args.freeze_mlp)
+    # Load model from checkpoint
+    start_step = 0
+    if args.load_from_checkpoint:
+        model, nglod_args, ckpt = load_psf_finetuned_checkpoint(args.load_from_checkpoint, device, args.freeze_mlp)
+        print(f"Resuming from PSF-finetuned checkpoint at step {ckpt.get('epoch', 0)}")
+    else:
+        model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, args.freeze_mlp)
     
     # 只对可训练参数创建优化器
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
-    print(f"优化器管理参数数量: {sum(p.numel() for p in trainable_params):,}")
+
+    # Load optimizer state if resuming from checkpoint
+    if args.load_from_checkpoint and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        print(f"Loaded optimizer state from checkpoint and updated lr to {args.lr}")
+
+    # Learning rate scheduler parameters
+    total_steps = args.steps
+    hold_steps = 0
+    decay_step_size = 100
+    gamma = 0.8
+    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=decay_step_size, gamma=gamma)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=3000, eta_min=1e-7)
     
     writer = SummaryWriter(log_dir=args.logdir)
 
     psf = np.load(args.psf_npy).astype(np.float32)
     if psf.ndim != 3:
         raise ValueError(f"PSF must be 3D, got shape {psf.shape}")
-    psf /= np.sum(psf)
+    psf = psf / (psf.sum() + 1e-12)
     psf_kernels = torch.from_numpy(psf).to(device)
 
-    if psf_kernels.shape[0] != args.block_z:
-        raise ValueError(f"PSF depth ({psf_kernels.shape[0]}) must match --block_z ({args.block_z})")
+    print(f"PSF shape: {psf_kernels.shape}, Block shape: ({args.block_z}, {args.block_h}, {args.block_w})")
+    if args.block_z < psf_kernels.shape[0]:
+        print(f"Warning: block_z ({args.block_z}) is smaller than PSF depth ({psf_kernels.shape[0]}). "
+              f"This may lead to boundary effects.")
+    else:
+        print(f"Block_z ({args.block_z}) >= PSF depth ({psf_kernels.shape[0]}), good for avoiding boundary effects.")
 
     block_shape = (args.block_z, args.block_h, args.block_w)
-    pbar = tqdm(range(args.steps), desc="PSF fine-tune NGLOD")
-    for step in pbar:
+    
+    pbar = tqdm(total=total_steps,
+            desc="Training steps", 
+            dynamic_ncols=True,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+
+    # 直接单层循环，每步训练一个随机块
+    for step in range(total_steps):
+        # 每步随机选择新的块位置
+        block_coords = sample_block_start_indices(vol_norm.shape, block_shape)
+        
         optimizer.zero_grad(set_to_none=True)
         
         total_loss = psf_finetune_step(
@@ -228,14 +312,25 @@ def main():
             global_step=step,
             psf_kernels=psf_kernels,
             block_shape=block_shape,
+            block_coords=block_coords,
         )
         
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
         optimizer.step()
         
+        # 前半段不调用 scheduler
+        # if step >= hold_steps:
+        scheduler.step()
+        
+        pbar.update(1)
+        
         if (step + 1) % 3 == 0:
-            pbar.set_postfix(total_loss=f"{total_loss.item():.12f}")
+            pbar.set_postfix_str(
+                f"loss {total_loss.item():.5f} lr {scheduler.get_last_lr()[0]:.6f}"
+            )
+
+    pbar.close()
 
     # Save new checkpoint
     save_obj = {
