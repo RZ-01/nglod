@@ -6,10 +6,7 @@ from typing import List
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import tifffile
-import cv2
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
 from lib.models.OctreeSDF import OctreeSDF
