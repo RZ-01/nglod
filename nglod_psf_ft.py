@@ -115,25 +115,40 @@ def load_psf_finetuned_checkpoint(checkpoint_path, device, freeze_mlp=True):
     return model, nglod_args, ckpt  
 
 
-def sample_block_start_indices(volume_shape, block_shape, psf_shape=None):
+def sample_block_start_indices(volume_shape, block_shape, psf_shape=None, step=0):
+    """
+    按照固定的行列顺序遍历blocks，从边界向内部，每个block只训练一次
+    """
     vz, vy, vx = volume_shape
     bz, by, bx = block_shape
     
-
     z_min, z_max = 200, 430
     z0_low = z_min
     z0_high_inclusive = max(z_min, z_max - bz + 1)
-    z0 = int(np.random.randint(z0_low, z0_high_inclusive + 1))
     
-    if psf_shape is not None:
-        pad_h, pad_w = psf_shape[1] // 2, psf_shape[2] // 2
-        ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
-        y0 = max(0, vy - ext_h)  
-        x0 = max(0, vx - ext_w)  
-    else:
-        y0 = max(0, vy - by)  # 最右边（y轴最大位置）
-        x0 = max(0, vx - bx)  # 最下边（x轴最大位置）
 
+    pad_h, pad_w = psf_shape[1] // 2, psf_shape[2] // 2
+    ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
+    y_max = vy - ext_h
+    x_max = vx - ext_w
+
+    z_steps = max(1, (z0_high_inclusive - z0_low) // max(1, bz // 4))  # Z方向步长
+    y_steps = max(1, y_max // max(1, by // 4))  # Y方向步长  
+    x_steps = max(1, x_max // max(1, bx // 4))  # X方向步长
+    
+    total_blocks = z_steps * y_steps * x_steps
+    
+    current_block = step % total_blocks
+    
+    z_idx = current_block // (y_steps * x_steps)
+    remaining = current_block % (y_steps * x_steps)
+    y_idx = remaining // x_steps
+    x_idx = remaining % x_steps
+    
+    z0 = z0_low + z_idx * max(1, bz // 4)
+    y0 = y_idx * max(1, by // 4)
+    x0 = x_idx * max(1, bx // 4)
+    
     return z0, y0, x0
 
 def build_plane_coords_and_mask(z_index: int, y_start: int, x_start: int, height: int, width: int,
@@ -304,10 +319,7 @@ def main():
 
     if args.load_from_checkpoint and 'optimizer_state_dict' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        # 强制更新学习率
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = args.lr
-        #print(f"Loaded optimizer state from checkpoint and updated lr to {args.lr}")
+        print(f"Loaded optimizer state from checkpoint and updated lr to {args.lr}")
 
     total_steps = args.steps
     #hold_steps = 200
@@ -325,9 +337,6 @@ def main():
     print(f"PSF shape: {psf_kernels.shape}, Block shape: ({args.block_z}, {args.block_h}, {args.block_w})")
     block_shape = (args.block_z, args.block_h, args.block_w)
     
-    # 每个block训练的epoch数
-    epochs_per_block = 10
-    
     pbar = tqdm(
         total=total_steps,
         desc="Training steps",
@@ -336,14 +345,8 @@ def main():
     )
     reg = args.reg_lambda
     
-    # 初始化第一个block
-    current_block_coords = sample_block_start_indices(vol_norm.shape, block_shape, psf_kernels.shape)
-    
     for step in range(total_steps):
-        # 每10个epoch切换到新的block
-        if step % epochs_per_block == 0:
-            current_block_coords = sample_block_start_indices(vol_norm.shape, block_shape, psf_kernels.shape)
-           # print(f"\nStep {step}: Switching to new block at coordinates {current_block_coords}")
+        current_block_coords = sample_block_start_indices(vol_norm.shape, block_shape, psf_kernels.shape, step)
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -372,12 +375,10 @@ def main():
         if step < 800 and (step + 1) % 100 == 0:
             reg *= 0.7
 
-        if step >= 800:
-            reg *= 0
 
-        
-        # 每隔200个epoch保存checkpoint
-        if (step + 1) % 4000 == 0:
+
+        # 每隔5000个epoch保存checkpoint
+        if (step + 1) % 5000 == 0:
             checkpoint_name = f"checkpoint_step_{step + 1}_block.pth"
             checkpoint_path = os.path.join(os.path.dirname(args.save_path), checkpoint_name)
             
