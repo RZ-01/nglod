@@ -6,7 +6,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from nglod_psf_ft_selective import compute_block_feature_mask
+from nglod_stage_2 import compute_block_feature_mask
 
 
 def visualize_2d_mask_slice(mask, title, lod_idx, z_slice=None):

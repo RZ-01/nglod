@@ -72,7 +72,7 @@ def build_plane_normalized_coords(z_index: int, height: int, width: int, full_di
 
 
 def predict_plane(coords_flat: torch.Tensor, model: OctreeSDF, lod_level: int = None) -> torch.Tensor:
-    """直接推理整个平面，不使用micro batch"""
+    """No micro batch"""
     if lod_level is not None:
         pred = model.sdf(coords_flat, lod=lod_level)
     else:
@@ -98,13 +98,13 @@ def choose_random_slices(dz: int, num_slices: int, seed: int) -> List[int]:
 
 def main():
     parser = argparse.ArgumentParser(description="Infer random z-slices from a trained NGLOD occupancy network and save as float32 TIF")
-    parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif", help="Path to the reference volume (for shape)")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_step_1300.pth", help="Path to the trained checkpoint .pth")
-    parser.add_argument("--out_dir", type=str, default="nglod_ft_1300", help="Directory to save inferred TIFs")
-    parser.add_argument("--num_slices", type=int, default=1, help="How many random z-slices to infer")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda or cpu)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for selecting slices")
-    parser.add_argument("--lod_level", type=int, default=None, help="Specific LOD level to use (0=coarse, 4=fine). None=auto select highest")
+    parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_step_1300.pth")
+    parser.add_argument("--out_dir", type=str, default="nglod_ft_1300")
+    parser.add_argument("--num_slices", type=int, default=1)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lod_level", type=int, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
