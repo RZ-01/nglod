@@ -8,7 +8,7 @@ import tifffile
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import sys
-import random
+import math
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
 from lib.models.OctreeSDF import OctreeSDF
@@ -67,21 +67,21 @@ def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
         for name, param in model.named_parameters():
             if 'louts' in name:  # MLP decoder参数
                 param.requires_grad = False
-                print(f"Frozen: {name}")
+                #print(f"Frozen: {name}")
         
         # 确保feature参数可训练
         for name, param in model.named_parameters():
             if 'features' in name and 'fm' in name:
                 param.requires_grad = True
-                print(f"Trainable: {name}, shape: {param.shape}")
+                #print(f"Trainable: {name}, shape: {param.shape}")
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     
-    print(f"\nTotal params: {total_params:,}")
-    print(f"Trainable params: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
-    print(f"Frozen params: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
+    #print(f"\nTotal params: {total_params:,}")
+    #print(f"Trainable params: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+    #print(f"Frozen params: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
     
     return model, nglod_args
 
@@ -166,19 +166,12 @@ def register_gradient_masks(model, block_coords, block_shape, volume_shape, base
     hook_handles = []
     
     for lod_idx, feature_module in enumerate(model.features):
-        # 计算该LOD的mask
         mask = compute_block_feature_mask(
             block_coords, block_shape, volume_shape, 
             lod_idx, base_lod, pad_ratio=0.3
         ).to(device)
         
-        # 统计mask覆盖的voxel数量
-        total_voxels = mask.numel()
-        active_voxels = mask.sum().item()
-        print(f"LOD {lod_idx}: {active_voxels}/{total_voxels} voxels active "
-              f"({active_voxels/total_voxels*100:.2f}%)")
-        
-        # 为该LOD的feature parameter注册backward hook
+
         def create_hook(mask_tensor):
             def hook(grad):
                 # 只保留mask为True的位置的梯度
@@ -187,7 +180,6 @@ def register_gradient_masks(model, block_coords, block_shape, volume_shape, base
                 return grad
             return hook
         
-        # 注册hook
         handle = feature_module.fm.register_hook(create_hook(mask))
         hook_handles.append(handle)
     
@@ -195,14 +187,20 @@ def register_gradient_masks(model, block_coords, block_shape, volume_shape, base
 
 
 def remove_gradient_hooks(hook_handles):
-    """移除所有的gradient hooks"""
     for handle in hook_handles:
         handle.remove()
 
+def idx_to_coord(start, end, stride, idx, steps):
+    if idx == steps - 1:
+        return end
+    return start + idx * stride
 
-def sample_block_start_indices(volume_shape, block_shape, psf_shape=None, step=0):
+def steps_ceil(start, end, stride):
+    return math.ceil((end - start) / stride)
+
+def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
     """
-    按照固定的行列顺序遍历blocks，从边界向内部，每个block只训练一次
+    Iterate through blocks in a fixed row-column order
     """
     vz, vy, vx = volume_shape
     bz, by, bx = block_shape
@@ -211,17 +209,23 @@ def sample_block_start_indices(volume_shape, block_shape, psf_shape=None, step=0
     z0_low = z_min
     z0_high_inclusive = max(z_min, z_max - bz + 1)
     
-    pad_h, pad_w = psf_shape[1] // 2, psf_shape[2] // 2
-    ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
-    y_max = vy - ext_h
-    x_max = vx - ext_w
+    #region_size = region_size
+    y_min = vy - region_size
+    x_min = vx - region_size
+    y_max = vy - by
+    x_max = vx - bx
 
-    z_steps = (z0_high_inclusive - z0_low) // (bz // 4)
-    y_steps = y_max // (by // 4)
-    x_steps = x_max // (bx // 4)
+    sz = bz // 4
+    sy = by // 4
+    sx = bx // 4
+
+    z_steps = steps_ceil(z0_low, z0_high_inclusive, sz)
+    y_steps = steps_ceil(y_min, y_max, sy)
+    x_steps = steps_ceil(x_min, x_max, sx)
+
     
     total_blocks = z_steps * y_steps * x_steps
-    
+
     current_block = step % total_blocks
     
     z_idx = current_block // (y_steps * x_steps)
@@ -229,61 +233,18 @@ def sample_block_start_indices(volume_shape, block_shape, psf_shape=None, step=0
     y_idx = remaining // x_steps
     x_idx = remaining % x_steps
     
-    z0 = z0_low + z_idx * (bz // 4)
-    y0 = y_idx * (by // 4)
-    x0 = x_idx * (bx // 4)
+    z0 = idx_to_coord(z0_low, z0_high_inclusive, sz, z_idx, z_steps)
+    y0 = idx_to_coord(y_min,     y_max,          sy, y_idx, y_steps)
+    x0 = idx_to_coord(x_min,     x_max,          sx, x_idx, x_steps)
     
     return z0, y0, x0
 
 
-def sample_random_points_outside_block(volume_shape, block_coords, block_shape, 
-                                     norm_volume_np, num_random_points=1000, 
-                                     device=torch.device('cuda')):
-    """采样块外的随机点用于正则化"""
-    vz, vy, vx = volume_shape
-    z0, y0, x0 = block_coords
-    bz, by, bx = block_shape
-    
-    block_z_end = z0 + bz
-    block_y_end = y0 + by
-    block_x_end = x0 + bx
-    
-    random_coords = []
-    random_values = []
-    
-    attempts = 0
-    max_attempts = num_random_points * 10
-    
-    while len(random_coords) < num_random_points and attempts < max_attempts:
-        attempts += 1
-        z_rand = random.randint(0, vz - 1)
-        y_rand = random.randint(0, vy - 1)
-        x_rand = random.randint(0, vx - 1)
-        
-        if not (z0 <= z_rand < block_z_end and 
-                y0 <= y_rand < block_y_end and 
-                x0 <= x_rand < block_x_end):
-            
-            z_norm = (z_rand / (vz - 1)) * 2.0 - 1.0
-            y_norm = (y_rand / (vy - 1)) * 2.0 - 1.0
-            x_norm = (x_rand / (vx - 1)) * 2.0 - 1.0
-            
-            random_coords.append([x_norm, y_norm, z_norm])
-            target_value = float(norm_volume_np[z_rand, y_rand, x_rand])
-            random_values.append(target_value)
-    
-    if len(random_coords) == 0:
-        return torch.empty((0, 3), device=device), torch.empty((0,), device=device)
-    
-    return torch.tensor(random_coords, device=device, dtype=torch.float32), \
-           torch.tensor(random_values, device=device, dtype=torch.float32)
 
 
 def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                       device: torch.device, writer: SummaryWriter, global_step: int,
-                      psf_kernels: torch.Tensor, block_shape, block_coords=None, 
-                      reg_lambda=0.01, random_points_lambda=0.1, 
-                      num_random_points=1000) -> torch.Tensor:
+                      psf_kernels: torch.Tensor, block_shape, block_coords=None) -> torch.Tensor:
     """PSF微调的单步训练"""
     model.train()
 
@@ -298,6 +259,7 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     z0, y0, x0 = block_coords
     ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
     ext_y0, ext_x0 = y0 - pad_h, x0 - pad_w
+    """
     
     extended_target_volume = torch.zeros((bz, ext_h, ext_w), device=device, dtype=torch.float32)
     
@@ -318,6 +280,7 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
             if 0 <= z_idx < vz:
                 target_slice = norm_volume_np[z_idx, y_start_global:y_end_global, x_start_global:x_end_global]
                 extended_target_volume[u, ext_y_start:ext_y_end, ext_x_start:ext_x_end] = torch.from_numpy(target_slice).to(device)
+    """
     
     # 预计算坐标网格
     ys_idx_all = torch.arange(ext_y0, ext_y0 + ext_h, device=device, dtype=torch.float32)
@@ -330,9 +293,8 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     xs_n_all = xs_idx_all / (vx - 1) * 2.0 - 1.0
     grid_y_all, grid_x_all = torch.meshgrid(ys_n_all, xs_n_all, indexing='ij')
     
-    # 生成预测 + 计算正则化损失
+    # 生成预测
     predicted_clear_extended_planes = []
-    reg_loss = 0.0
     
     for u in range(bz):
         z_idx = z0 + u
@@ -345,12 +307,6 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
         pred_plane_ext = pred_flat.view(1, 1, ext_h, ext_w)
         pred_plane_ext = pred_plane_ext * mask_ext_all.to(pred_plane_ext.dtype).unsqueeze(0).unsqueeze(0)
         predicted_clear_extended_planes.append(pred_plane_ext)
-        
-        # 正则化损失
-        if mask_ext_all.sum() > 0:
-            pred_2d = pred_plane_ext.squeeze(0).squeeze(0)
-            target_2d = extended_target_volume[u]
-            reg_loss += F.l1_loss(pred_2d[mask_ext_all], target_2d[mask_ext_all])
 
     # PSF卷积模拟
     simulated_focal_planes = []
@@ -367,34 +323,15 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                 
         simulated_focal_planes.append(simulated_focal_plane)
     
-    # 计算主损失
+    # 计算损失
     target_block_np = norm_volume_np[z0:z0+bz, y0:y0+by, x0:x0+bx]
     target_block = torch.from_numpy(target_block_np).to(device=device, dtype=torch.float32)
     simulated_block = torch.cat(simulated_focal_planes, dim=0).squeeze(1)
-    main_loss = F.l1_loss(simulated_block, target_block)
+    loss = F.l1_loss(simulated_block, target_block)
     
-    reg_loss = reg_loss / bz if bz > 0 else reg_loss
+    writer.add_scalar("PSF_FT_Selective/Loss", loss.item(), global_step)
     
-    # 随机点正则化
-    random_coords, random_values = sample_random_points_outside_block(
-        norm_volume_np.shape, block_coords, block_shape, norm_volume_np, 
-        num_random_points, device
-    )
-    
-    random_points_loss = 0.0
-    if len(random_coords) > 0:
-        random_preds = model.sdf(random_coords)
-        random_points_loss = F.l1_loss(random_preds.squeeze(), random_values)
-    
-    # 总损失
-    total_loss = main_loss + reg_lambda * reg_loss + random_points_lambda * random_points_loss
-    
-    writer.add_scalar("PSF_FT_Selective/Main_Loss", main_loss.item(), global_step)
-    writer.add_scalar("PSF_FT_Selective/Reg_Loss", reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss, global_step)
-    writer.add_scalar("PSF_FT_Selective/Random_Points_Loss", random_points_loss.item() if isinstance(random_points_loss, torch.Tensor) else random_points_loss, global_step)
-    writer.add_scalar("PSF_FT_Selective/Total_Loss", total_loss.item(), global_step)
-    
-    return total_loss
+    return loss
 
 
 def main():
@@ -402,17 +339,14 @@ def main():
     parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")  
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
-    parser.add_argument("--steps", type=int, default=5000)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--block_z", type=int, default=125)
-    parser.add_argument("--block_h", type=int, default=133)
-    parser.add_argument("--block_w", type=int, default=133)
+    parser.add_argument("--steps", type=int, default=4800)
+    parser.add_argument("--lr", type=float, default=6e-3)
+    parser.add_argument("--block_z", type=int, default=115)
+    parser.add_argument("--block_h", type=int, default=266)
+    parser.add_argument("--block_w", type=int, default=266)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_selective.pth")
-    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_selective")
-    parser.add_argument("--reg_lambda", type=float, default=0.01, help="块内正则化损失权重")
-    parser.add_argument("--random_points_lambda", type=float, default=0.1, help="随机点正则化损失权重")
-    parser.add_argument("--num_random_points", type=int, default=2000, help="随机点数量")
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_plain.pth")
+    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_plain")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
@@ -446,23 +380,53 @@ def main():
     
     block_shape = (args.block_z, args.block_h, args.block_w)
     
+    # Debug block大小为训练块的1/4
+   # debug_block_shape = (args.block_z // 32, args.block_h // 32, args.block_w // 32)  # 约(31, 33, 33)
+   # xy_region_start = vol_norm.shape[1] - 266
+    #debug_block_coords = (250, xy_region_start + 50, xy_region_start + 50)  
+    #ebug_losses = []  
+    
+    #print(f"Debug monitoring block at coordinates: {debug_block_coords}")
+    
     pbar = tqdm(
         total=total_steps,
-        desc="Training with selective feature updates",
+        desc="Training ",
         dynamic_ncols=True,
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
     )
     
-    reg = args.reg_lambda
-    random_points_reg = args.random_points_lambda
-    
     for step in range(total_steps):
-        # 确定当前训练的block
         current_block_coords = sample_block_start_indices(
-            vol_norm.shape, block_shape, psf_kernels.shape, step
+            vol_norm.shape, block_shape, 532, step
         )
         
-        # 注册梯度mask，只允许当前block相关的features更新
+        # 检查当前训练的block是否与debug block重叠
+        """
+        cz, cy, cx = current_block_coords
+        dz, dy, dx = debug_block_coords
+        dbz, dby, dbx = debug_block_shape
+        bz, by, bx = block_shape
+        
+        # 扩展训练块的范围（考虑pad_ratio=0.3）
+        pad_z = bz * 0.3
+        pad_y = by * 0.3
+        pad_x = bx * 0.3
+        
+        c_z_min, c_z_max = cz - pad_z, cz + bz + pad_z
+        c_y_min, c_y_max = cy - pad_y, cy + by + pad_y
+        c_x_min, c_x_max = cx - pad_x, cx + bx + pad_x
+        
+        d_z_min, d_z_max = dz, dz + dbz
+        d_y_min, d_y_max = dy, dy + dby
+        d_x_min, d_x_max = dx, dx + dbx
+        
+        # 检查是否有重叠（两个box相交）
+        overlap_z = not (c_z_max <= d_z_min or c_z_min >= d_z_max)
+        overlap_y = not (c_y_max <= d_y_min or c_y_min >= d_y_max)
+        overlap_x = not (c_x_max <= d_x_min or c_x_min >= d_x_max)
+        is_debug_block_affected = overlap_z and overlap_y and overlap_x
+        """
+        
         hook_handles = register_gradient_masks(
             model, current_block_coords, block_shape, 
             vol_norm.shape, nglod_args.base_lod, device
@@ -470,7 +434,7 @@ def main():
         
         optimizer.zero_grad(set_to_none=True)
         
-        total_loss = psf_finetune_step(
+        loss = psf_finetune_step(
             model=model,
             norm_volume_np=vol_norm,
             device=device,
@@ -479,14 +443,10 @@ def main():
             psf_kernels=psf_kernels,
             block_shape=block_shape,
             block_coords=current_block_coords,
-            reg_lambda=reg,
-            random_points_lambda=random_points_reg,
-            num_random_points=args.num_random_points,
         )
         
-        total_loss.backward()
+        loss.backward()
         
-        # 移除hooks
         remove_gradient_hooks(hook_handles)
         
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=30.0)
@@ -495,45 +455,39 @@ def main():
         
         pbar.update(1)
         pbar.set_postfix({
-            'loss': f'{total_loss.item():.6f}',
+            'loss': f'{loss.item():.6f}',
             'block': f'({current_block_coords[0]},{current_block_coords[1]},{current_block_coords[2]})'
         })
-        
-        # 动态调整正则化权重
-        if step < 800 and (step + 1) % 100 == 0:
-            reg *= 0.7
-
-        # 定期保存checkpoint
-        if (step + 1) % 1000 == 0 or step == total_steps - 1:
-            checkpoint_name = f"checkpoint_step_{step + 1}.pth"
-            checkpoint_path = os.path.join(os.path.dirname(args.save_path), checkpoint_name)
-            
-            save_obj = {
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'nglod_args': nglod_args,
-                'psf_finetune_config': {
-                    'lr': args.lr,
-                    'steps': args.steps,
-                    'block_z': args.block_z,
-                    'block_h': args.block_h,
-                    'block_w': args.block_w,
-                    'psf_npy': args.psf_npy,
-                    'volume_tif': args.volume_tif,
-                    'reg_lambda': args.reg_lambda,
-                    'random_points_lambda': args.random_points_lambda,
-                    'num_random_points': args.num_random_points,
-                },
-                'finetune_type': 'psf_selective',
-                'training_mode': 'selective_feature_update'
-            }
-            torch.save(save_obj, checkpoint_path)
-            print(f"\nSaved checkpoint at step {step + 1}: {checkpoint_path}")
+        """
+        if step % 1 == 0: 
+            with torch.no_grad():
+                debug_loss = psf_finetune_step(
+                    model=model,
+                    norm_volume_np=vol_norm,
+                    device=device,
+                    writer=writer,
+                    global_step=step,
+                    psf_kernels=psf_kernels,
+                    block_shape=debug_block_shape,
+                    block_coords=debug_block_coords,
+                    reg_lambda=reg,
+                )
+                debug_losses.append(debug_loss.item())
+                writer.add_scalar("Debug/Fixed_Block_Loss", debug_loss.item(), step)
+                writer.add_scalar("Debug/Is_Debug_Block_Affected", float(is_debug_block_affected), step)
+                
+                if len(debug_losses) >= 2:
+                    loss_change = debug_losses[-1] - debug_losses[-2]
+                    affected_str = "AFFECTED" if is_debug_block_affected else "NOT affected"
+                    print(f"\n[DEBUG] Step {step}: Debug block {debug_block_coords} (size={debug_block_shape})")
+                    print(f"  Training block {current_block_coords} (size={block_shape})")
+                    print(f"  Loss = {debug_loss.item():.6f}, change = {loss_change:+.6f}, {affected_str}")
+                """
+        #if step < 800 and (step + 1) % 100 == 0:
+        #    reg *= 0.7
 
     pbar.close()
 
-    # 保存最终模型
     save_obj = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -546,9 +500,6 @@ def main():
             'block_w': args.block_w,
             'psf_npy': args.psf_npy,
             'volume_tif': args.volume_tif,
-            'reg_lambda': args.reg_lambda,
-            'random_points_lambda': args.random_points_lambda,
-            'num_random_points': args.num_random_points,
         },
         'finetune_type': 'psf_selective',
         'training_mode': 'selective_feature_update'

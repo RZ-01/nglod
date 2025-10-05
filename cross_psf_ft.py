@@ -201,7 +201,6 @@ def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
     z0_low = z_min
     z0_high_inclusive = max(z_min, z_max - bz + 1)
     
-    #region_size = region_size
     y_min = vy - region_size
     x_min = vx - region_size
     y_max = vy - by
@@ -215,7 +214,6 @@ def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
     y_steps = steps_ceil(y_min, y_max, sy)
     x_steps = steps_ceil(x_min, x_max, sx)
 
-    
     total_blocks = z_steps * y_steps * x_steps
 
     current_block = step % total_blocks
@@ -297,6 +295,41 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     return loss
 
 
+def get_training_schedule(total_steps, switch_every, feature_boost_ratio=2.0):
+    schedule = []
+    step = 0
+    mode = 'feature'  # Start with feature
+    
+    # Calculate transition point (last 30% of training)
+    transition_point = int(total_steps * 0.7)
+    
+    while step < total_steps:
+        if step < transition_point:
+            # Normal alternating phase
+            next_step = min(step + switch_every, transition_point)
+            schedule.append((step, next_step, mode))
+            step = next_step
+            mode = 'mlp' if mode == 'feature' else 'feature'
+        else:
+            # Weighted phase: more feature optimization
+            if mode == 'feature':
+                # Longer feature optimization periods
+                duration = int(switch_every * feature_boost_ratio)
+                next_step = min(step + duration, total_steps)
+                schedule.append((step, next_step, 'feature'))
+                step = next_step
+                mode = 'mlp'
+            else:
+                # Shorter MLP optimization periods
+                duration = switch_every
+                next_step = min(step + duration, total_steps)
+                schedule.append((step, next_step, 'mlp'))
+                step = next_step
+                mode = 'feature'
+    
+    return schedule
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
@@ -305,12 +338,13 @@ def main():
     parser.add_argument("--steps", type=int, default=4200)
     parser.add_argument("--lr", type=float, default=6e-3)
     parser.add_argument("--switch_every", type=int, default=200, help="Steps to alternate between training feature and MLP")
+    parser.add_argument("--feature_boost_ratio", type=float, default=2.0)
     parser.add_argument("--block_z", type=int, default=115)
     parser.add_argument("--block_h", type=int, default=266)
     parser.add_argument("--block_w", type=int, default=266)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_large.pth")
-    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_large")
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_large_new.pth")
+    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_large_new")
     parser.add_argument("--region_size", type=int, default=532)
     args = parser.parse_args()
 
@@ -322,7 +356,6 @@ def main():
     vol_max = float(vol.max())
     vol_norm = vol / vol_max
     
-    # Load the model, do not freeze any parameters at this time, controlled by the set_trainable_parameters function
     model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, freeze_mlp=False)
     
     total_steps = args.steps
@@ -338,23 +371,41 @@ def main():
     
     block_shape = (args.block_z, args.block_h, args.block_w)
     
-    # --- Alternating Training Setup ---
-    training_mode = 'feature'  # Start by updating features
-    trainable_params = set_trainable_parameters(model, training_mode)
+    # Generate training schedule
+    schedule = get_training_schedule(total_steps, args.switch_every, args.feature_boost_ratio)
+    
+    # Print schedule summary
+    print("Training Schedule:")
+    print(f"  Phase 1 (steps 0-{int(total_steps*0.7)}): Regular alternating (1:1 ratio)")
+    print(f"  Phase 2 (steps {int(total_steps*0.7)}-{total_steps}): Feature-focused ({args.feature_boost_ratio}:1 ratio)")
+    
+    feature_steps = sum(end - start for start, end, mode in schedule if mode == 'feature')
+    mlp_steps = sum(end - start for start, end, mode in schedule if mode == 'mlp')
+    print(f"  Total feature steps: {feature_steps} ({feature_steps/total_steps*100:.1f}%)")
+    print(f"  Total MLP steps: {mlp_steps} ({mlp_steps/total_steps*100:.1f}%)\n")
+    
+    # Initialize with first mode
+    current_mode = schedule[0][2]
+    trainable_params = set_trainable_parameters(model, current_mode)
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
     
     pbar = tqdm(
         total=total_steps,
-        desc="Alternating Training ",
+        desc="Weighted Feature Training",
         dynamic_ncols=True,
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
     )
     
+    schedule_idx = 0
     for step in range(total_steps):
-        if step > 0 and step % args.switch_every == 0:
-            training_mode = 'mlp' if training_mode == 'feature' else 'feature'
-            trainable_params = set_trainable_parameters(model, training_mode)
-            optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+        if step >= schedule[schedule_idx][1]:
+            schedule_idx += 1
+            if schedule_idx < len(schedule):
+                new_mode = schedule[schedule_idx][2]
+                if new_mode != current_mode:
+                    current_mode = new_mode
+                    trainable_params = set_trainable_parameters(model, current_mode, verbose=False)
+                    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
         eta_min = 1e-5
         current_lr = eta_min + (args.lr - eta_min) * 0.5 * (1 + np.cos(np.pi * step / total_steps))
@@ -366,7 +417,7 @@ def main():
         )
         
         hook_handles = []
-        if training_mode == 'feature':
+        if current_mode == 'feature':
             hook_handles = register_gradient_masks(
                 model, current_block_coords, block_shape, 
                 vol_norm.shape, nglod_args.base_lod, device
@@ -382,7 +433,7 @@ def main():
         
         loss.backward()
         
-        if training_mode == 'feature':
+        if current_mode == 'feature':
             remove_gradient_hooks(hook_handles)
         
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=30.0)
@@ -390,7 +441,7 @@ def main():
         
         pbar.update(1)
         pbar.set_postfix({
-            'mode': training_mode,
+            'mode': current_mode,
             'loss': f'{loss.item():.6f}',
             'lr': f'{current_lr:.2e}',
             'block': f'({current_block_coords[0]},{current_block_coords[1]},{current_block_coords[2]})'
@@ -402,22 +453,10 @@ def main():
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'nglod_args': nglod_args,
-        'psf_finetune_config': {
-            'lr': args.lr,
-            'steps': args.steps,
-            'switch_every': args.switch_every,
-            'block_z': args.block_z,
-            'block_h': args.block_h,
-            'block_w': args.block_w,
-            'psf_npy': args.psf_npy,
-            'volume_tif': args.volume_tif,
-        },
-        'finetune_type': 'psf_alternating',
     }
     torch.save(save_obj, args.save_path)
-    print(f"\nSaved final PSF-finetuned model (alternating training) to {args.save_path}")
+    print(f"\nSaved final PSF-finetuned model (weighted feature training) to {args.save_path}")
 
 
 if __name__ == "__main__":
     main()
-

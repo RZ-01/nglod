@@ -10,14 +10,10 @@ from tqdm import tqdm
 import time
 import sys
 import os
-# image小块采样
-# 大分辨率的图，然后小块采样
 torch.set_float32_matmul_precision('high')
 
-# 添加 NGLOD 路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sdf-net'))
 from lib.models.OctreeSDF import OctreeSDF
-# 设置随机种子
 torch.manual_seed(42)
 np.random.seed(42)
 
@@ -27,7 +23,6 @@ def download_simple_image():
     return np.array(img) / 255.0
 
 def create_psf(size=25, sigma=3.5):
-    """创建泊松PSF（Airy disk pattern）"""
     from scipy.special import j1  
     
     psf = np.zeros((size, size))
@@ -63,7 +58,6 @@ def create_G_psf(size=15, sigma=2.0):
     return psf
 
 class NGLODArgs:
-    """NGLOD 图像去模糊的参数配置"""
     def __init__(self):
         # ===== 网络架构参数 =====
         self.net = 'OctreeSDF'
@@ -102,7 +96,6 @@ def sample_random_patch(H: int, W: int, patch_h: int, patch_w: int):
     return y0, x0
 
 def build_extended_patch_coords(y0_ext: int, x0_ext: int, ext_h: int, ext_w: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """构建扩展后的图像块坐标（用于卷积）"""
     ys_ext = torch.linspace(-1.0 + 2.0 * y0_ext / (H - 1), -1.0 + 2.0 * (y0_ext + ext_h - 1) / (H - 1), steps=ext_h, device=device)
     xs_ext = torch.linspace(-1.0 + 2.0 * x0_ext / (W - 1), -1.0 + 2.0 * (x0_ext + ext_w - 1) / (W - 1), steps=ext_w, device=device)
     grid_y, grid_x = torch.meshgrid(ys_ext, xs_ext, indexing='ij')
@@ -135,19 +128,16 @@ def apply_psf_torch(image, psf, device=None):
     return blurred
 
 def train_deblur_nglod_patch(clear_img, blurred_img, psf):
-    """使用分块训练的NGLOD图像去模糊"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     H, W = clear_img.shape
     
-    # 将图像转换为tensor
-    clear_tensor = torch.from_numpy(clear_img).float().to(device)
     blurred_tensor = torch.from_numpy(blurred_img).float().to(device)
 
     args = NGLODArgs()
     model = OctreeSDF(args).to(device)
     
-    # === 打印模型参数信息 ===
+    # === 打印参数信息 ===
     total_params = sum(p.numel() for p in model.parameters())
     feat_params = 0
     mlp_params = 0
@@ -165,20 +155,18 @@ def train_deblur_nglod_patch(clear_img, blurred_img, psf):
     psf_kernel = torch.from_numpy(psf).float().unsqueeze(0).unsqueeze(0).to(device)
     psf_pad = psf.shape[0] // 2
     
-    patch_size = 128  # 块大小
+    patch_size = 128  
     all_losses = []
     
-    pbar = tqdm(total=args.epochs, desc="Training NGLOD (Patch-based)", ncols=100, 
+    pbar = tqdm(total=args.epochs, desc="Training NGLOD ", ncols=100, 
                 dynamic_ncols=True, leave=True, file=None, 
                 ascii=True, disable=False)
     start_time = time.time()
 
     for epoch in range(args.epochs):
-        # 随机选择一个patch
         patch_h = patch_w = min(patch_size, min(H, W))
         y0, x0 = sample_random_patch(H, W, patch_h, patch_w)
         
-        # 计算扩展区域（用于卷积，避免边界效应）
         y0_ext = max(0, y0 - psf_pad)
         x0_ext = max(0, x0 - psf_pad)
         y1_ext = min(H, y0 + patch_h + psf_pad)
@@ -186,30 +174,22 @@ def train_deblur_nglod_patch(clear_img, blurred_img, psf):
         ext_h = y1_ext - y0_ext
         ext_w = x1_ext - x0_ext
         
-        # 在扩展区域中，原始patch的相对位置
         y_core0 = y0 - y0_ext
         x_core0 = x0 - x0_ext
         
-        # 构建扩展区域的坐标
         coords_ext = build_extended_patch_coords(y0_ext, x0_ext, ext_h, ext_w, H, W, device)
         
-        # 获取目标模糊patch（不包含扩展）
         target_blurred_patch = blurred_tensor[y0:y0+patch_h, x0:x0+patch_w].unsqueeze(0).unsqueeze(0)
         
-        # 前向传播：预测扩展区域的清晰图像
         pred_flat = model.sdf(coords_ext, return_lst=False)  # [ext_h*ext_w, 1]
         predicted_clear_ext = pred_flat.view(1, 1, ext_h, ext_w)
         
-        # 对扩展区域应用PSF卷积
         predicted_blurred_ext = F.conv2d(predicted_clear_ext, psf_kernel, padding=psf_pad)
         
-        # 从卷积结果中提取核心patch
         predicted_blurred_patch = predicted_blurred_ext[:, :, y_core0:y_core0+patch_h, x_core0:x_core0+patch_w]
         
-        # 计算损失（只在核心patch上）
         loss = nn.MSELoss()(predicted_blurred_patch, target_blurred_patch)
         
-        # 反向传播
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -244,7 +224,6 @@ def train_deblur_nglod(clear_img, blurred_img, psf):
     psf_kernel = torch.from_numpy(psf).float().unsqueeze(0).unsqueeze(0).to(device)
     psf_pad = psf.shape[0] // 2
     
-    # 构建整个图像的坐标
     coords_full = build_image_coords(H, W, device)
     
     all_losses = []
@@ -291,10 +270,8 @@ def main():
     blurred_img = convolve(clear_img, psf, mode='constant')
     
     blur_strength = np.std(clear_img) / np.std(blurred_img) if np.std(blurred_img) > 0 else 1
-    print(f"模糊强度比: {blur_strength:.2f} ")
     
 
-    # 使用分块训练
     model, losses = train_deblur_nglod_patch(clear_img, blurred_img, psf)
     
     device = next(model.parameters()).device
@@ -342,7 +319,6 @@ def main():
     axes[1, 2].axis('off')
     
     plt.tight_layout()
-    #plt.savefig('deblur_results.png', dpi=150, bbox_inches='tight')
     plt.show()
 
     return model, clear_img, blurred_img, deblurred_img
