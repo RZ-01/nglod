@@ -15,7 +15,6 @@ from lib.models.OctreeSDF import OctreeSDF
 
 
 class Args:
-    """NGLOD原始参数类 - 用于加载nglod.py保存的检查点"""
     def __init__(self):
         # ===== 网络架构参数 =====
         self.net = 'OctreeSDF'
@@ -50,8 +49,7 @@ class Args:
         self.return_lst = True
 
 
-def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
-    """加载NGLOD模型并冻结MLP参数"""
+def load_nglod_model(checkpoint_path, device, load_previous_chekp, freeze_mlp=True):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if 'args' in ckpt:
         nglod_args = ckpt['args']
@@ -62,54 +60,46 @@ def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
     model = OctreeSDF(nglod_args).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     
-    # 冻结所有MLP参数
     if freeze_mlp:
         for name, param in model.named_parameters():
-            if 'louts' in name:  # MLP decoder参数
+            if 'louts' in name:  
                 param.requires_grad = False
-                #print(f"Frozen: {name}")
         
-        # 确保feature参数可训练
         for name, param in model.named_parameters():
             if 'features' in name and 'fm' in name:
                 param.requires_grad = True
-                #print(f"Trainable: {name}, shape: {param.shape}")
     
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params = total_params - trainable_params
+    optimizer_state_dict = None
+    scheduler_state_dict = None
     
-    #print(f"\nTotal params: {total_params:,}")
-    #print(f"Trainable params: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
-    #print(f"Frozen params: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
+    if load_previous_chekp:     
+        optimizer_state_dict = ckpt.get('optimizer_state_dict')
+        scheduler_state_dict = ckpt.get('scheduler_state_dict')
+        
+    return model, nglod_args, optimizer_state_dict, scheduler_state_dict
+
+
+def load_training_config_from_checkpoint(checkpoint_path):
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
-    return model, nglod_args
+    if 'psf_finetune_config' in ckpt:
+        config = ckpt['psf_finetune_config']
+        print("Loaded training config from checkpoint:")
+        for key, value in config.items():
+            print(f"  {key}: {value}")
+        return config
+    else:
+        raise ValueError("No psf_finetune_config found in checkpoint, using default values")
 
 
 def compute_block_feature_mask(block_coords, block_shape, volume_shape, 
                                lod_idx, base_lod, pad_ratio=0.2):
-    """
-    计算当前block在指定LOD的feature grid中对应的voxel范围
-    
-    Args:
-        block_coords: (z0, y0, x0) 块的起始坐标（在原始volume中）
-        block_shape: (bz, by, bx) 块的形状
-        volume_shape: (vz, vy, vx) 完整volume的形状
-        lod_idx: 当前LOD层级索引
-        base_lod: base LOD参数
-        pad_ratio: 扩展比例，用于包含邻近的feature voxels
-    
-    Returns:
-        mask: 布尔tensor，形状为feature grid的形状，True表示该voxel需要更新
-    """
     z0, y0, x0 = block_coords
     bz, by, bx = block_shape
     vz, vy, vx = volume_shape
     
-    # 计算该LOD的feature grid分辨率
     fsize = 2 ** (lod_idx + base_lod)
     
-    # 将block坐标转换到归一化空间[-1, 1]
     z0_norm = (z0 / (vz - 1)) * 2.0 - 1.0
     y0_norm = (y0 / (vy - 1)) * 2.0 - 1.0
     x0_norm = (x0 / (vx - 1)) * 2.0 - 1.0
@@ -118,7 +108,6 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
     y1_norm = ((y0 + by - 1) / (vy - 1)) * 2.0 - 1.0
     x1_norm = ((x0 + bx - 1) / (vx - 1)) * 2.0 - 1.0
     
-    # 扩展边界，确保包含所有可能被采样的feature voxels
     pad_z = (z1_norm - z0_norm) * pad_ratio
     pad_y = (y1_norm - y0_norm) * pad_ratio
     pad_x = (x1_norm - x0_norm) * pad_ratio
@@ -129,9 +118,7 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
     z1_norm += pad_z
     y1_norm += pad_y
     x1_norm += pad_x
-    
-    # 将归一化坐标转换到feature grid坐标 [0, fsize]
-    # grid_sample使用的坐标范围是[-1,1]对应到[0, fsize]
+
     z0_feat = (z0_norm + 1.0) / 2.0 * fsize
     y0_feat = (y0_norm + 1.0) / 2.0 * fsize
     x0_feat = (x0_norm + 1.0) / 2.0 * fsize
@@ -140,7 +127,6 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
     y1_feat = (y1_norm + 1.0) / 2.0 * fsize
     x1_feat = (x1_norm + 1.0) / 2.0 * fsize
     
-    # 转换为整数索引（向下取整和向上取整）
     z0_idx = max(0, int(np.floor(z0_feat)))
     y0_idx = max(0, int(np.floor(y0_feat)))
     x0_idx = max(0, int(np.floor(x0_feat)))
@@ -149,7 +135,6 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
     y1_idx = min(fsize, int(np.ceil(y1_feat)) + 1)
     x1_idx = min(fsize, int(np.ceil(x1_feat)) + 1)
     
-    # 创建mask
     mask = torch.zeros((1, 1, fsize+1, fsize+1, fsize+1), dtype=torch.bool)
     mask[0, 0, z0_idx:z1_idx, y0_idx:y1_idx, x0_idx:x1_idx] = True
     
@@ -157,12 +142,7 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
 
 
 def register_gradient_masks(model, block_coords, block_shape, volume_shape, base_lod, device):
-    """
-    为模型的feature parameters注册梯度mask，只允许与当前block相关的features更新
-    
-    Returns:
-        hook_handles: hook句柄列表，用于后续移除
-    """
+
     hook_handles = []
     
     for lod_idx, feature_module in enumerate(model.features):
@@ -174,7 +154,6 @@ def register_gradient_masks(model, block_coords, block_shape, volume_shape, base
 
         def create_hook(mask_tensor):
             def hook(grad):
-                # 只保留mask为True的位置的梯度
                 if grad is not None:
                     return grad * mask_tensor.float()
                 return grad
@@ -199,17 +178,14 @@ def steps_ceil(start, end, stride):
     return math.ceil((end - start) / stride)
 
 def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
-    """
-    Iterate through blocks in a fixed row-column order
-    """
+
     vz, vy, vx = volume_shape
     bz, by, bx = block_shape
     
-    z_min, z_max = 200, 430
+    z_min, z_max = 0, vz  
     z0_low = z_min
-    z0_high_inclusive = max(z_min, z_max - bz + 1)
+    z0_high_inclusive = max(z_min, z_max - bz)  
     
-    #region_size = region_size
     y_min = vy - region_size
     x_min = vx - region_size
     y_max = vy - by
@@ -245,7 +221,6 @@ def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
 def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                       device: torch.device, writer: SummaryWriter, global_step: int,
                       psf_kernels: torch.Tensor, block_shape, block_coords=None) -> torch.Tensor:
-    """PSF微调的单步训练"""
     model.train()
 
     vz, vy, vx = norm_volume_np.shape
@@ -259,30 +234,7 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     z0, y0, x0 = block_coords
     ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
     ext_y0, ext_x0 = y0 - pad_h, x0 - pad_w
-    """
-    
-    extended_target_volume = torch.zeros((bz, ext_h, ext_w), device=device, dtype=torch.float32)
-    
-    # 计算全局有效范围
-    y_start_global = max(0, ext_y0)
-    y_end_global = min(vy, ext_y0 + ext_h)
-    x_start_global = max(0, ext_x0)  
-    x_end_global = min(vx, ext_x0 + ext_w)
-    
-    if y_start_global < y_end_global and x_start_global < x_end_global:
-        ext_y_start = y_start_global - ext_y0
-        ext_y_end = y_end_global - ext_y0
-        ext_x_start = x_start_global - ext_x0
-        ext_x_end = x_end_global - ext_x0
-        
-        for u in range(bz):
-            z_idx = z0 + u
-            if 0 <= z_idx < vz:
-                target_slice = norm_volume_np[z_idx, y_start_global:y_end_global, x_start_global:x_end_global]
-                extended_target_volume[u, ext_y_start:ext_y_end, ext_x_start:ext_x_end] = torch.from_numpy(target_slice).to(device)
-    """
-    
-    # 预计算坐标网格
+
     ys_idx_all = torch.arange(ext_y0, ext_y0 + ext_h, device=device, dtype=torch.float32)
     xs_idx_all = torch.arange(ext_x0, ext_x0 + ext_w, device=device, dtype=torch.float32)
     valid_y_all = (ys_idx_all >= 0) & (ys_idx_all < vy)
@@ -323,7 +275,6 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                 
         simulated_focal_planes.append(simulated_focal_plane)
     
-    # 计算损失
     target_block_np = norm_volume_np[z0:z0+bz, y0:y0+by, x0:x0+bx]
     target_block = torch.from_numpy(target_block_np).to(device=device, dtype=torch.float32)
     simulated_block = torch.cat(simulated_focal_planes, dim=0).squeeze(1)
@@ -339,15 +290,39 @@ def main():
     parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")  
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
-    parser.add_argument("--steps", type=int, default=4800)
+    parser.add_argument("--steps", type=int, default=6400)
     parser.add_argument("--lr", type=float, default=6e-3)
-    parser.add_argument("--block_z", type=int, default=115)
-    parser.add_argument("--block_h", type=int, default=266)
-    parser.add_argument("--block_w", type=int, default=266)
+    parser.add_argument("--block_z", type=int, default=250)
+    parser.add_argument("--block_h", type=int, default=540)
+    parser.add_argument("--block_w", type=int, default=540)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_plain.pth")
-    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_plain")
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_complete.pth")
+    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_complete")
+    parser.add_argument("--load_from_checkpoint", type=str, default=None, 
+                       help="Load training parameters from this checkpoint instead of using argparse values")
     args = parser.parse_args()
+    
+    if args.load_from_checkpoint:
+        print(f"Loading training parameters from checkpoint: {args.load_from_checkpoint}")
+        checkpoint_config = load_training_config_from_checkpoint(args.load_from_checkpoint)
+        
+        if checkpoint_config:
+            args.volume_tif = checkpoint_config.get('volume_tif', args.volume_tif)
+            args.psf_npy = checkpoint_config.get('psf_npy', args.psf_npy)
+            args.steps = checkpoint_config.get('steps', args.steps)
+            args.lr = checkpoint_config.get('lr', args.lr)
+            args.block_z = checkpoint_config.get('block_z', args.block_z)
+            args.block_h = checkpoint_config.get('block_h', args.block_h)
+            args.block_w = checkpoint_config.get('block_w', args.block_w)
+            
+            print("Using parameters from checkpoint:")
+            print(f"  volume_tif: {args.volume_tif}")
+            print(f"  psf_npy: {args.psf_npy}")
+            print(f"  steps: {args.steps}")
+            print(f"  lr: {args.lr}")
+            print(f"  block_shape: ({args.block_z}, {args.block_h}, {args.block_w})")
+        
+        args.checkpoint = args.load_from_checkpoint
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
 
@@ -358,15 +333,27 @@ def main():
     vol_max = float(vol.max())
     vol_norm = vol / vol_max
     
-    # 加载模型并冻结MLP
-    model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, freeze_mlp=True)
+    model, nglod_args, saved_optimizer_state, saved_scheduler_state = load_nglod_model(args.checkpoint, device, load_previous_chekp=args.load_from_checkpoint)
     
-    # 只优化feature parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    
+    if args.load_from_checkpoint and saved_optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(saved_optimizer_state)
+            print("Successfully loaded optimizer state from checkpoint")
+        except Exception as e:
+            raise ValueError(f"Failed to load optimizer state: {e}")
 
     total_steps = args.steps
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-5)
+    
+    if args.load_from_checkpoint and saved_scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(saved_scheduler_state)
+            print("Successfully loaded scheduler state from checkpoint")
+        except Exception as e:
+            raise ValueError(f"Failed to load scheduler state: {e}")
     
     writer = SummaryWriter(log_dir=args.logdir)
 
@@ -380,14 +367,6 @@ def main():
     
     block_shape = (args.block_z, args.block_h, args.block_w)
     
-    # Debug block大小为训练块的1/4
-   # debug_block_shape = (args.block_z // 32, args.block_h // 32, args.block_w // 32)  # 约(31, 33, 33)
-   # xy_region_start = vol_norm.shape[1] - 266
-    #debug_block_coords = (250, xy_region_start + 50, xy_region_start + 50)  
-    #ebug_losses = []  
-    
-    #print(f"Debug monitoring block at coordinates: {debug_block_coords}")
-    
     pbar = tqdm(
         total=total_steps,
         desc="Training ",
@@ -397,35 +376,8 @@ def main():
     
     for step in range(total_steps):
         current_block_coords = sample_block_start_indices(
-            vol_norm.shape, block_shape, 532, step
+            vol_norm.shape, block_shape, 1080, step
         )
-        
-        # 检查当前训练的block是否与debug block重叠
-        """
-        cz, cy, cx = current_block_coords
-        dz, dy, dx = debug_block_coords
-        dbz, dby, dbx = debug_block_shape
-        bz, by, bx = block_shape
-        
-        # 扩展训练块的范围（考虑pad_ratio=0.3）
-        pad_z = bz * 0.3
-        pad_y = by * 0.3
-        pad_x = bx * 0.3
-        
-        c_z_min, c_z_max = cz - pad_z, cz + bz + pad_z
-        c_y_min, c_y_max = cy - pad_y, cy + by + pad_y
-        c_x_min, c_x_max = cx - pad_x, cx + bx + pad_x
-        
-        d_z_min, d_z_max = dz, dz + dbz
-        d_y_min, d_y_max = dy, dy + dby
-        d_x_min, d_x_max = dx, dx + dbx
-        
-        # 检查是否有重叠（两个box相交）
-        overlap_z = not (c_z_max <= d_z_min or c_z_min >= d_z_max)
-        overlap_y = not (c_y_max <= d_y_min or c_y_min >= d_y_max)
-        overlap_x = not (c_x_max <= d_x_min or c_x_min >= d_x_max)
-        is_debug_block_affected = overlap_z and overlap_y and overlap_x
-        """
         
         hook_handles = register_gradient_masks(
             model, current_block_coords, block_shape, 
@@ -458,39 +410,13 @@ def main():
             'loss': f'{loss.item():.6f}',
             'block': f'({current_block_coords[0]},{current_block_coords[1]},{current_block_coords[2]})'
         })
-        """
-        if step % 1 == 0: 
-            with torch.no_grad():
-                debug_loss = psf_finetune_step(
-                    model=model,
-                    norm_volume_np=vol_norm,
-                    device=device,
-                    writer=writer,
-                    global_step=step,
-                    psf_kernels=psf_kernels,
-                    block_shape=debug_block_shape,
-                    block_coords=debug_block_coords,
-                    reg_lambda=reg,
-                )
-                debug_losses.append(debug_loss.item())
-                writer.add_scalar("Debug/Fixed_Block_Loss", debug_loss.item(), step)
-                writer.add_scalar("Debug/Is_Debug_Block_Affected", float(is_debug_block_affected), step)
-                
-                if len(debug_losses) >= 2:
-                    loss_change = debug_losses[-1] - debug_losses[-2]
-                    affected_str = "AFFECTED" if is_debug_block_affected else "NOT affected"
-                    print(f"\n[DEBUG] Step {step}: Debug block {debug_block_coords} (size={debug_block_shape})")
-                    print(f"  Training block {current_block_coords} (size={block_shape})")
-                    print(f"  Loss = {debug_loss.item():.6f}, change = {loss_change:+.6f}, {affected_str}")
-                """
-        #if step < 800 and (step + 1) % 100 == 0:
-        #    reg *= 0.7
 
     pbar.close()
 
     save_obj = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'nglod_args': nglod_args,
         'psf_finetune_config': {
             'lr': args.lr,

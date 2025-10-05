@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-NGLOD高级PSF微调：按Octree Node渐进式训练
-"""
+
 import argparse
 import os
 import numpy as np
@@ -20,7 +18,6 @@ torch.set_float32_matmul_precision('high')
 
 
 class Args:
-    """NGLOD原始参数类"""
     def __init__(self):
         self.net = 'OctreeSDF'
         self.feature_dim = 32     

@@ -15,7 +15,6 @@ from lib.models.OctreeSDF import OctreeSDF
 
 
 class Args:
-    """Original NGLOD arguments class - for loading checkpoints saved by nglod.py"""
     def __init__(self):
         # ===== Network Architecture Parameters =====
         self.net = 'OctreeSDF'
@@ -51,7 +50,6 @@ class Args:
 
 
 def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
-    """Load NGLOD model and optionally freeze MLP parameters"""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if 'args' in ckpt:
         nglod_args = ckpt['args']
@@ -70,19 +68,13 @@ def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
 
 
 def set_trainable_parameters(model, mode, verbose=True):
-    """
-    Set the trainable parts of the model based on the mode.
-
-    Args:
-        model (nn.Module): The model.
-        mode (str): 'feature' or 'mlp'.
-        verbose (bool): Whether to print status information.
-    """
+   # Set the trainable parts of the model based on the mode.
+   #     verbose (bool): Whether to print status information.
     if verbose:
         print(f"\n---> Switching training mode to '{mode}' <---")
         
     for name, param in model.named_parameters():
-        if 'louts' in name:  # MLP decoder parameters
+        if 'louts' in name: # MLP parameters
             param.requires_grad = (mode == 'mlp')
         elif 'features' in name and 'fm' in name:  # Feature grid parameters
             param.requires_grad = (mode == 'feature')
@@ -91,20 +83,15 @@ def set_trainable_parameters(model, mode, verbose=True):
 
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
     
-    if verbose:
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in trainable_params_list)
-        print(f"Total parameters:     {total:,}")
-        print(f"Trainable parameters: {trainable:,} ({trainable/total*100:.2f}%)")
-        
+    
     return trainable_params_list
 
 
 def compute_block_feature_mask(block_coords, block_shape, volume_shape, 
                                lod_idx, base_lod, pad_ratio=0.2):
-    """
-    Calculate the corresponding voxel range for the current block in the specified LOD's feature grid
-    """
+
+    #Calculate the corresponding voxel range for the current block in the specified LOD's feature grid
+
     z0, y0, x0 = block_coords
     bz, by, bx = block_shape
     vz, vy, vx = volume_shape
@@ -153,9 +140,7 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
 
 
 def register_gradient_masks(model, block_coords, block_shape, volume_shape, base_lod, device):
-    """
-    Register gradient masks for the model's feature parameters, allowing only features related to the current block to be updated
-    """
+   # Register gradient masks for the model's feature parameters, allowing only features related to the current block to be updated
     hook_handles = []
     
     for lod_idx, feature_module in enumerate(model.features):
@@ -191,9 +176,7 @@ def steps_ceil(start, end, stride):
     return math.ceil((end - start) / stride)
 
 def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
-    """
-    Iterate through blocks in a fixed row-column order
-    """
+  #  Iterate through blocks in a fixed row-column order
     vz, vy, vx = volume_shape
     bz, by, bx = block_shape
     
@@ -233,7 +216,6 @@ def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
 def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
                       device: torch.device, writer: SummaryWriter, global_step: int,
                       psf_kernels: torch.Tensor, block_shape, block_coords=None) -> torch.Tensor:
-    """A single training step for PSF fine-tuning"""
     model.train()
 
     vz, vy, vx = norm_volume_np.shape
@@ -300,27 +282,22 @@ def get_training_schedule(total_steps, switch_every, feature_boost_ratio=2.0):
     step = 0
     mode = 'feature'  # Start with feature
     
-    # Calculate transition point (last 30% of training)
     transition_point = int(total_steps * 0.7)
     
     while step < total_steps:
         if step < transition_point:
-            # Normal alternating phase
             next_step = min(step + switch_every, transition_point)
             schedule.append((step, next_step, mode))
             step = next_step
             mode = 'mlp' if mode == 'feature' else 'feature'
         else:
-            # Weighted phase: more feature optimization
             if mode == 'feature':
-                # Longer feature optimization periods
                 duration = int(switch_every * feature_boost_ratio)
                 next_step = min(step + duration, total_steps)
                 schedule.append((step, next_step, 'feature'))
                 step = next_step
                 mode = 'mlp'
             else:
-                # Shorter MLP optimization periods
                 duration = switch_every
                 next_step = min(step + duration, total_steps)
                 schedule.append((step, next_step, 'mlp'))
@@ -371,10 +348,8 @@ def main():
     
     block_shape = (args.block_z, args.block_h, args.block_w)
     
-    # Generate training schedule
     schedule = get_training_schedule(total_steps, args.switch_every, args.feature_boost_ratio)
     
-    # Print schedule summary
     print("Training Schedule:")
     print(f"  Phase 1 (steps 0-{int(total_steps*0.7)}): Regular alternating (1:1 ratio)")
     print(f"  Phase 2 (steps {int(total_steps*0.7)}-{total_steps}): Feature-focused ({args.feature_boost_ratio}:1 ratio)")
@@ -384,7 +359,6 @@ def main():
     print(f"  Total feature steps: {feature_steps} ({feature_steps/total_steps*100:.1f}%)")
     print(f"  Total MLP steps: {mlp_steps} ({mlp_steps/total_steps*100:.1f}%)\n")
     
-    # Initialize with first mode
     current_mode = schedule[0][2]
     trainable_params = set_trainable_parameters(model, current_mode)
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
