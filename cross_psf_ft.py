@@ -50,6 +50,7 @@ class Args:
 
 
 def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
+    """Load NGLOD model and optionally freeze MLP parameters"""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if 'args' in ckpt:
         nglod_args = ckpt['args']
@@ -67,31 +68,18 @@ def load_nglod_model_from_checkpoint(checkpoint_path, device, freeze_mlp=True):
     return model, nglod_args
 
 
-def set_trainable_parameters(model, mode, verbose=True):
-   # Set the trainable parts of the model based on the mode.
-   #     verbose (bool): Whether to print status information.
-    if verbose:
-        print(f"\n---> Switching training mode to '{mode}' <---")
-        
-    for name, param in model.named_parameters():
-        if 'louts' in name: # MLP parameters
-            param.requires_grad = (mode == 'mlp')
-        elif 'features' in name and 'fm' in name:  # Feature grid parameters
-            param.requires_grad = (mode == 'feature')
-        else:
-            param.requires_grad = False  # Freeze anything else
-
-    trainable_params_list = [p for p in model.parameters() if p.requires_grad]
-    
-    
-    return trainable_params_list
+def get_parameter_groups(model):
+    """Extract feature and MLP parameter groups"""
+    feature_params = [p for n, p in model.named_parameters() if 'features' in n and 'fm' in n]
+    mlp_params = [p for n, p in model.named_parameters() if 'louts' in n]
+    return feature_params, mlp_params
 
 
 def compute_block_feature_mask(block_coords, block_shape, volume_shape, 
                                lod_idx, base_lod, pad_ratio=0.2):
-
-    #Calculate the corresponding voxel range for the current block in the specified LOD's feature grid
-
+    """
+    Calculate the corresponding voxel range for the current block in the specified LOD's feature grid
+    """
     z0, y0, x0 = block_coords
     bz, by, bx = block_shape
     vz, vy, vx = volume_shape
@@ -140,7 +128,6 @@ def compute_block_feature_mask(block_coords, block_shape, volume_shape,
 
 
 def register_gradient_masks(model, block_coords, block_shape, volume_shape, base_lod, device):
-   # Register gradient masks for the model's feature parameters, allowing only features related to the current block to be updated
     hook_handles = []
     
     for lod_idx, feature_module in enumerate(model.features):
@@ -176,7 +163,9 @@ def steps_ceil(start, end, stride):
     return math.ceil((end - start) / stride)
 
 def sample_block_start_indices(volume_shape, block_shape, region_size, step=0):
-  #  Iterate through blocks in a fixed row-column order
+    """
+    Iterate through blocks in a fixed row-column order
+    """
     vz, vy, vx = volume_shape
     bz, by, bx = block_shape
     
@@ -277,34 +266,16 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     return loss
 
 
-def get_training_schedule(total_steps, switch_every, feature_boost_ratio=2.0):
-    schedule = []
-    step = 0
-    mode = 'feature'  # Start with feature
-    
+def get_current_mode(step, total_steps, feature_steps, mlp_steps):
     transition_point = int(total_steps * 0.7)
-    
-    while step < total_steps:
-        if step < transition_point:
-            next_step = min(step + switch_every, transition_point)
-            schedule.append((step, next_step, mode))
-            step = next_step
-            mode = 'mlp' if mode == 'feature' else 'feature'
-        else:
-            if mode == 'feature':
-                duration = int(switch_every * feature_boost_ratio)
-                next_step = min(step + duration, total_steps)
-                schedule.append((step, next_step, 'feature'))
-                step = next_step
-                mode = 'mlp'
-            else:
-                duration = switch_every
-                next_step = min(step + duration, total_steps)
-                schedule.append((step, next_step, 'mlp'))
-                step = next_step
-                mode = 'feature'
-    
-    return schedule
+    if step >= transition_point:
+        return 'feature'
+    cycle_length = feature_steps + mlp_steps
+    position_in_cycle = step % cycle_length
+    if position_in_cycle < feature_steps:
+        return 'feature'
+    else:
+        return 'mlp'
 
 
 def main():
@@ -312,21 +283,21 @@ def main():
     parser.add_argument("--volume_tif", type=str, default="../data/Mouse_Heart_Angle0_patch.tif")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/nglod_angle_0.pth")  
     parser.add_argument("--psf_npy", type=str, default="psf_t0_v0.npy")
-    parser.add_argument("--steps", type=int, default=4200)
+    parser.add_argument("--steps", type=int, default=4800)
     parser.add_argument("--lr", type=float, default=6e-3)
-    parser.add_argument("--switch_every", type=int, default=200, help="Steps to alternate between training feature and MLP")
-    parser.add_argument("--feature_boost_ratio", type=float, default=2.0)
-    parser.add_argument("--block_z", type=int, default=115)
+    parser.add_argument("--feature_steps", type=int, default=1000, help="Steps for feature training in each cycle")
+    parser.add_argument("--mlp_steps", type=int, default=30, help="Steps for MLP training in each cycle")
+    parser.add_argument("--mlp_lr", type=float, default=1e-5, help="Learning rate for MLP training")
+    parser.add_argument("--block_z", type=int, default=275)
     parser.add_argument("--block_h", type=int, default=266)
     parser.add_argument("--block_w", type=int, default=266)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_large_new.pth")
-    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_large_new")
-    parser.add_argument("--region_size", type=int, default=532)
+    parser.add_argument("--save_path", type=str, default="checkpoints/nglod_psf_small_new.pth")
+    parser.add_argument("--logdir", type=str, default="runs/psf_finetune_small_new")
+    parser.add_argument("--region_size", type=int, default=266)
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     print(f"Using device: {device}")
 
     vol = tifffile.imread(args.volume_tif).astype(np.float32)
@@ -334,6 +305,8 @@ def main():
     vol_norm = vol / vol_max
     
     model, nglod_args = load_nglod_model_from_checkpoint(args.checkpoint, device, freeze_mlp=False)
+    
+    feature_params, mlp_params = get_parameter_groups(model)
     
     total_steps = args.steps
     writer = SummaryWriter(log_dir=args.logdir)
@@ -344,58 +317,73 @@ def main():
 
     print(f"\nPSF shape: {psf_kernels.shape}")
     print(f"Block shape: ({args.block_z}, {args.block_h}, {args.block_w})")
-    print(f"Volume shape: {vol_norm.shape}\n")
+    print(f"Volume shape: {vol_norm.shape}")
+    print(f"Feature params: {sum(p.numel() for p in feature_params):,}")
+    print(f"MLP params: {sum(p.numel() for p in mlp_params):,}\n")
     
     block_shape = (args.block_z, args.block_h, args.block_w)
-    
-    schedule = get_training_schedule(total_steps, args.switch_every, args.feature_boost_ratio)
-    
+
     print("Training Schedule:")
-    print(f"  Phase 1 (steps 0-{int(total_steps*0.7)}): Regular alternating (1:1 ratio)")
-    print(f"  Phase 2 (steps {int(total_steps*0.7)}-{total_steps}): Feature-focused ({args.feature_boost_ratio}:1 ratio)")
+    print(f"  Phase 1 (steps 0-{int(total_steps*0.7)}): Alternating training (feature:{args.feature_steps}, MLP:{args.mlp_steps})")
+    print(f"  Phase 2 (steps {int(total_steps*0.7)}-{total_steps}): Feature-only training (no MLP)")
+    print(f"  Feature LR: {args.lr:.2e}, MLP LR: {args.mlp_lr:.2e}\n")
     
-    feature_steps = sum(end - start for start, end, mode in schedule if mode == 'feature')
-    mlp_steps = sum(end - start for start, end, mode in schedule if mode == 'mlp')
-    print(f"  Total feature steps: {feature_steps} ({feature_steps/total_steps*100:.1f}%)")
-    print(f"  Total MLP steps: {mlp_steps} ({mlp_steps/total_steps*100:.1f}%)\n")
+    optimizer = torch.optim.Adam([
+        {'params': feature_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.mlp_lr}
+    ])
     
-    current_mode = schedule[0][2]
-    trainable_params = set_trainable_parameters(model, current_mode)
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    current_mode = None
+    prev_block_coords = None
+    hook_handles = []
     
     pbar = tqdm(
         total=total_steps,
-        desc="Weighted Feature Training",
+        desc="PSF Fine-tuning",
         dynamic_ncols=True,
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
     )
     
-    schedule_idx = 0
     for step in range(total_steps):
-        if step >= schedule[schedule_idx][1]:
-            schedule_idx += 1
-            if schedule_idx < len(schedule):
-                new_mode = schedule[schedule_idx][2]
-                if new_mode != current_mode:
-                    current_mode = new_mode
-                    trainable_params = set_trainable_parameters(model, current_mode, verbose=False)
-                    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+        new_mode = get_current_mode(step, total_steps, args.feature_steps, args.mlp_steps)
+        
+        # Only switch requires_grad when mode changes
+        if new_mode != current_mode:
+            for p in feature_params:
+                p.requires_grad = (new_mode == 'feature')
+            for p in mlp_params:
+                p.requires_grad = (new_mode == 'mlp')
+            current_mode = new_mode
 
-        eta_min = 1e-5
-        current_lr = eta_min + (args.lr - eta_min) * 0.5 * (1 + np.cos(np.pi * step / total_steps))
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = current_lr
+        # Apply cosine annealing to appropriate param group
+        base_lr = args.lr if current_mode == 'feature' else args.mlp_lr
+        eta_min = base_lr * 0.01
+        current_lr = eta_min + (base_lr - eta_min) * 0.5 * (1 + np.cos(np.pi * step / total_steps))
+        
+        group_idx = 0 if current_mode == 'feature' else 1
+        optimizer.param_groups[group_idx]['lr'] = current_lr
 
+        # Sample block
         current_block_coords = sample_block_start_indices(
             vol_norm.shape, block_shape, args.region_size, step
         )
         
-        hook_handles = []
+        # Only register hooks if feature mode AND block changed
         if current_mode == 'feature':
-            hook_handles = register_gradient_masks(
-                model, current_block_coords, block_shape, 
-                vol_norm.shape, nglod_args.base_lod, device
-            )
+            if current_block_coords != prev_block_coords:
+                if hook_handles:
+                    remove_gradient_hooks(hook_handles)
+                hook_handles = register_gradient_masks(
+                    model, current_block_coords, block_shape, 
+                    vol_norm.shape, nglod_args.base_lod, device
+                )
+        else:
+            # Remove hooks when switching to MLP mode
+            if hook_handles:
+                remove_gradient_hooks(hook_handles)
+                hook_handles = []
+        
+        prev_block_coords = current_block_coords
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -407,10 +395,10 @@ def main():
         
         loss.backward()
         
-        if current_mode == 'feature':
-            remove_gradient_hooks(hook_handles)
+        # Only clip grads for active params
+        active_params = feature_params if current_mode == 'feature' else mlp_params
+        torch.nn.utils.clip_grad_norm_(active_params, max_norm=30.0)
         
-        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=30.0)
         optimizer.step()
         
         pbar.update(1)
@@ -422,6 +410,10 @@ def main():
         })
 
     pbar.close()
+    
+    # Clean up hooks
+    if hook_handles:
+        remove_gradient_hooks(hook_handles)
 
     save_obj = {
         'model_state_dict': model.state_dict(),
@@ -429,7 +421,7 @@ def main():
         'nglod_args': nglod_args,
     }
     torch.save(save_obj, args.save_path)
-    print(f"\nSaved final PSF-finetuned model (weighted feature training) to {args.save_path}")
+    print(f"\nSaved final PSF-finetuned model to {args.save_path}")
 
 
 if __name__ == "__main__":
