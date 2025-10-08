@@ -226,6 +226,8 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
     vz, vy, vx = norm_volume_np.shape
     bz, by, bx = block_shape
     pad_h, pad_w = 9, 9  # PSF大小19x19，padding=(19-1)//2=9
+    psf_depth = psf_kernels.shape[0]
+    psf_center = psf_depth // 2
 
     z0, y0, x0 = block_coords
     ext_h, ext_w = by + 2 * pad_h, bx + 2 * pad_w
@@ -256,25 +258,21 @@ def psf_finetune_step(model: nn.Module, norm_volume_np: np.ndarray,
         pred_plane_ext = pred_plane_ext * mask_ext_all.to(pred_plane_ext.dtype).unsqueeze(0).unsqueeze(0)
         predicted_clear_extended_planes.append(pred_plane_ext)
 
-    # 堆叠所有清晰层: [1, 1, bz, ext_h, ext_w]
-    clear_volume = torch.stack(predicted_clear_extended_planes, dim=2).squeeze(1)
+    predicted_volume = torch.stack(predicted_clear_extended_planes, dim=2)
     
     psf_kernel_3d = psf_kernels.unsqueeze(0).unsqueeze(0)
     
-    z_padding = 12  # 硬编码
-    
-    simulated_volume = F.conv3d(
-        clear_volume, 
+    simulated_block = F.conv3d(
+        predicted_volume, 
         psf_kernel_3d, 
-        bias=None,  # PSF物理模型不需要bias
-        padding=(z_padding, 0, 0)
-    )  
+        padding=(psf_center, 0, 0)
+    )
     
-    target_block = torch.from_numpy(
-        norm_volume_np[z0:z0+bz, y0:y0+by, x0:x0+bx]
-    ).to(device=device, dtype=torch.float32)
+    simulated_block = simulated_block.squeeze(0).squeeze(0)
     
-    simulated_block = simulated_volume.squeeze(0).squeeze(0)  # [bz, by, bx]
+    # 计算损失
+    target_block_np = norm_volume_np[z0:z0+bz, y0:y0+by, x0:x0+bx]
+    target_block = torch.from_numpy(target_block_np).to(device=device, dtype=torch.float32)
     loss = F.l1_loss(simulated_block, target_block)
     
     writer.add_scalar("PSF_FT_Selective/Loss", loss.item(), global_step)
